@@ -596,16 +596,29 @@ function createDriverExperienceAdminRouter({ getDb, getNotifications = null }) {
   router.get('/point-topups', async (req, res) => {
     try {
       const status = clean(req.query.status || '', 40).toUpperCase();
-      const keyword = clean(req.query.q || '', 120).toLowerCase();
-      const query = status && status !== 'ALL' ? { status } : {};
-      const rows = await getDb().collection('driver_point_topups')
-        .find(query)
-        .sort({ createdAt: -1 })
-        .limit(500)
-        .toArray();
+      const keyword = clean(req.query.q || '', 120);
+      const page = Math.max(1, Math.round(Number(req.query.page) || 1));
+      const limit = Math.max(1, Math.min(100, Math.round(Number(req.query.limit) || 20)));
+      const db = getDb();
+      const statusQuery = status && status !== 'ALL' ? { status } : {};
+      let query = statusQuery;
+      if (keyword) {
+        const regex = { $regex: keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+        const matchedDrivers = await db.collection('drivers').find({ $or: [{ fullName: regex }, { phone: regex }] }).project({ _id: 1 }).toArray();
+        const searchable = { $or: [
+          { 'driverSnapshot.fullName': regex }, { 'driverSnapshot.phone': regex },
+          { transferCode: regex }, { transferContent: regex }, { bankTransactionId: regex },
+          { driverId: { $in: matchedDrivers.map((driver) => driver._id) } },
+        ] };
+        query = Object.keys(statusQuery).length ? { $and: [statusQuery, searchable] } : searchable;
+      }
+      const [rows, total] = await Promise.all([
+        db.collection('driver_point_topups').find(query).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).toArray(),
+        db.collection('driver_point_topups').countDocuments(query),
+      ]);
       const driverIds = [...new Set(rows.map((x) => String(x.driverId)))].map(oid).filter(Boolean);
       const drivers = driverIds.length
-        ? await getDb().collection('drivers').find({ _id: { $in: driverIds } }).project({ fullName: 1, phone: 1, userId: 1 }).toArray()
+        ? await db.collection('drivers').find({ _id: { $in: driverIds } }).project({ fullName: 1, phone: 1, userId: 1 }).toArray()
         : [];
       const byDriver = new Map(drivers.map((x) => [String(x._id), x]));
       const mapped = rows.map((x) => ({
@@ -620,16 +633,10 @@ function createDriverExperienceAdminRouter({ getDb, getNotifications = null }) {
           };
         })(),
       }));
-      const filtered = keyword
-        ? mapped.filter((x) => [
-            x.driver?.fullName,
-            x.driver?.phone,
-            x.transferCode,
-            x.transferContent,
-            x.bankTransactionId,
-          ].some((v) => String(v || '').toLowerCase().includes(keyword)))
-        : mapped;
-      return res.json({ topups: filtered });
+      return res.json({
+        topups: mapped,
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      });
     } catch (error) { return res.status(500).json({ message: error.message }); }
   });
 

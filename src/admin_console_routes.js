@@ -155,6 +155,28 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     await audit.createIndex({actorType:1,createdAt:-1},{name:'idx_audit_actor_type_created'}).catch(()=>{});
     await audit.createIndex({actorId:1,createdAt:-1},{name:'idx_audit_actor_created'}).catch(()=>{});
     await audit.createIndex({action:1,createdAt:-1},{name:'idx_audit_action_created'}).catch(()=>{});
+    // List screens always sort newest-first and load only one page.  These
+    // indexes keep page changes fast even when the Atlas collections grow.
+    await Promise.all([
+      db().collection('bookings').createIndex({createdAt:-1},{name:'idx_bookings_created'}),
+      db().collection('bookings').createIndex({status:1,createdAt:-1},{name:'idx_bookings_status_created'}),
+      db().collection('bookings').createIndex({customerId:1,createdAt:-1},{name:'idx_bookings_customer_created'}),
+      db().collection('bookings').createIndex({customerPhone:1,createdAt:-1},{name:'idx_bookings_customer_phone_created'}),
+      db().collection('bookings').createIndex({'customerSnapshot.phone':1,createdAt:-1},{name:'idx_bookings_customer_snapshot_phone_created'}),
+      db().collection('users').createIndex({roles:1,createdAt:-1},{name:'idx_users_roles_created'}),
+      db().collection('drivers').createIndex({kycStatus:1,updatedAt:-1},{name:'idx_drivers_kyc_updated'}),
+      db().collection('drivers').createIndex({updatedAt:-1},{name:'idx_drivers_updated'}),
+      db().collection('merchants').createIndex({createdAt:-1},{name:'idx_merchants_created'}),
+      db().collection('orders').createIndex({createdAt:-1},{name:'idx_orders_created'}),
+      db().collection('orders').createIndex({status:1,serviceCode:1,createdAt:-1},{name:'idx_orders_status_service_created'}),
+      db().collection('payments').createIndex({createdAt:-1},{name:'idx_payments_created'}),
+      db().collection('admin_broadcasts').createIndex({createdAt:-1},{name:'idx_admin_broadcasts_created'}),
+      db().collection('notification_outbox').createIndex({broadcastId:1,status:1},{name:'idx_outbox_broadcast_status'}),
+      db().collection('notifications').createIndex({broadcastId:1},{name:'idx_notifications_broadcast'}),
+      db().collection('promotions').createIndex({createdAt:-1},{name:'idx_promotions_created'}),
+      db().collection('driver_point_topups').createIndex({status:1,createdAt:-1},{name:'idx_point_topups_status_created'}),
+      db().collection('conversations').createIndex({type:1,status:1,updatedAt:-1},{name:'idx_support_conversations_updated'}),
+    ].map((job)=>job.catch(()=>{})));
     for(const [code,name,permissions] of DEFAULT_ADMIN_ROLES){
       const setOnInsert={code,name,permissions,status:'ACTIVE',createdAt:new Date()};
       const update=code==='SUPER_ADMIN'
@@ -279,7 +301,8 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
   // Read-only audit history for internal admin accounts.
   router.get('/api/admin-audit',requireAdminAccess('audit.view'),async(req,res)=>{
     try{
-      const limit=Math.min(500,Math.max(1,Number(req.query.limit||250)));
+      const limit=Math.min(100,Math.max(1,Number(req.query.limit||20)));
+      const page=Math.max(1,Math.round(Number(req.query.page||1)));
       const filter={actorType:'ADMIN'};
       const action=String(req.query.action||'').trim();
       const actorId=objectIdOrNull(req.query.actorId);
@@ -293,25 +316,22 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
         if(to){const d=new Date(`${to}T23:59:59.999`);if(!Number.isNaN(d.getTime()))filter.createdAt.$lte=d}
         if(!Object.keys(filter.createdAt).length)delete filter.createdAt;
       }
+      const q=String(req.query.q||'').trim();
+      if(q){const regex={$regex:q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),$options:'i'};filter.$or=[{action:regex},{entityType:regex},{entityId:regex},{ip:regex},{actorName:regex},{actorPhone:regex},{actorEmail:regex}];}
 
-      let logs=await db().collection('audit_logs').find(filter).sort({createdAt:-1}).limit(limit).toArray();
+      const [logs,total]=await Promise.all([db().collection('audit_logs').find(filter).sort({createdAt:-1}).skip((page-1)*limit).limit(limit).toArray(),db().collection('audit_logs').countDocuments(filter)]);
       const actorIds=[...new Set(logs.map(x=>x.actorId).filter(Boolean).map(String))].map(objectIdOrNull).filter(Boolean);
       const actors=actorIds.length?await db().collection('users').find({_id:{$in:actorIds},roles:'ADMIN'}).project({fullName:1,phone:1,email:1,status:1}).toArray():[];
       const actorMap=new Map(actors.map(a=>[String(a._id),a]));
-      const q=String(req.query.q||'').trim().toLowerCase();
       const rows=logs.map(log=>{
         const actor=actorMap.get(String(log.actorId||''));
         return {
           ...serializeDoc(log),
           actor:actor?{id:String(actor._id),fullName:actor.fullName||log.actorName||'Quản trị viên',phone:actor.phone||log.actorPhone||null,email:actor.email||log.actorEmail||null,status:actor.status||'ACTIVE'}:{id:log.actorId?String(log.actorId):null,fullName:log.actorName||'Tài khoản cũ/không xác định',phone:log.actorPhone||null,email:log.actorEmail||null,status:null}
         };
-      }).filter(row=>{
-        if(!q)return true;
-        const text=[row.action,row.entityType,row.entityId,row.ip,row.actor?.fullName,row.actor?.phone,row.actor?.email,JSON.stringify(row.before||{}),JSON.stringify(row.after||{})].join(' ').toLowerCase();
-        return text.includes(q);
       });
       const actorList=await db().collection('users').find({roles:'ADMIN'}).project({fullName:1,phone:1,email:1,status:1}).sort({fullName:1}).toArray();
-      res.json({logs:rows,actors:actorList.map(a=>({id:String(a._id),fullName:a.fullName||'Quản trị viên',phone:a.phone||null,email:a.email||null,status:a.status||'ACTIVE'}))});
+      res.json({logs:rows,pagination:{page,limit,total,totalPages:Math.max(1,Math.ceil(total/limit))},actors:actorList.map(a=>({id:String(a._id),fullName:a.fullName||'Quản trị viên',phone:a.phone||null,email:a.email||null,status:a.status||'ACTIVE'}))});
     }catch(error){res.status(500).json({message:error.message})}
   });
 
@@ -399,17 +419,21 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
 
   router.get('/api/admin-support/conversations', requireAdminAccess('support.view'), async (req, res) => {
     try {
-      const limit = Math.min(150, Math.max(1, Number(req.query.limit || 100)));
+      const limit = Math.min(100, Math.max(1, Number(req.query.limit || 20)));
+      const page = Math.max(1, Math.round(Number(req.query.page || 1)));
       const status = String(req.query.status || 'ALL').trim().toUpperCase();
-      const query = String(req.query.q || '').trim().toLowerCase();
+      const query = String(req.query.q || '').trim();
       const filter = supportConversationFilter();
       if (status !== 'ALL') filter.status = status;
-      const docs = await db().collection('conversations')
-        .find(filter)
-        .sort({ updatedAt: -1, _id: -1 })
-        .limit(limit)
-        .toArray();
-      if (!docs.length) return res.json([]);
+      if (query) {
+        const regex = { $regex: query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+        filter.$or = [{ title: regex }, { lastMessage: regex }];
+      }
+      const [docs, total] = await Promise.all([
+        db().collection('conversations').find(filter).sort({ updatedAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).toArray(),
+        db().collection('conversations').countDocuments(filter),
+      ]);
+      if (!docs.length) return res.json({ items: [], pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } });
 
       const ids = docs.map((x) => x._id);
       const ownerIds = [...new Set(docs.map((x) => String(x.ownerUserId || '')).filter(Boolean))]
@@ -446,10 +470,7 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
           createdAt: doc.createdAt || null, updatedAt: doc.updatedAt || null,
         };
       });
-      const filtered = query
-        ? rows.filter((row) => [row.title, row.lastMessage, row.owner?.fullName, row.owner?.phone, row.owner?.email, ...(row.owner?.roles || [])].join(' ').toLowerCase().includes(query))
-        : rows;
-      res.json(filtered);
+      res.json({ items: rows, pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } });
     } catch (error) {
       res.status(500).json({ message: error.message });
     }
@@ -632,11 +653,15 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
 
   router.get('/api/admin-management/bootstrap',requireAnyAdminAccess(['admins.view','admins.manage','roles.manage']),async(req,res)=>{
     try{
-      const [accounts,roles]=await Promise.all([
-        req.adminAccess.permissions.includes('admins.view')?db().collection('users').find({roles:'ADMIN'}).sort({createdAt:1,_id:1}).toArray():[],
+      const page=Math.max(1,Math.round(Number(req.query.page)||1)),limit=Math.max(1,Math.min(100,Math.round(Number(req.query.limit)||20)));
+      const q=String(req.query.q||'').trim();const accountFilter={roles:'ADMIN'};
+      if(q){const regex={$regex:q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),$options:'i'};accountFilter.$or=[{fullName:regex},{phone:regex},{email:regex}];}
+      const [accounts,roles,total]=await Promise.all([
+        req.adminAccess.permissions.includes('admins.view')?db().collection('users').find(accountFilter).sort({createdAt:1,_id:1}).skip((page-1)*limit).limit(limit).toArray():[],
         db().collection('admin_roles').find({}).sort({code:1}).toArray()
+        ,req.adminAccess.permissions.includes('admins.view')?db().collection('users').countDocuments(accountFilter):Promise.resolve(0)
       ]);
-      res.json({accounts:accounts.map(publicInternalAdmin),roles:roles.map(r=>({...r,_id:String(r._id)})),permissions:ADMIN_ALL_PERMISSIONS});
+      res.json({accounts:accounts.map(publicInternalAdmin),roles:roles.map(r=>({...r,_id:String(r._id)})),pagination:{page,limit,total,totalPages:Math.max(1,Math.ceil(total/limit))},permissions:ADMIN_ALL_PERMISSIONS});
     }catch(error){res.status(500).json({message:error.message})}
   });
 
@@ -750,6 +775,33 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
   router.get('/api/data/settings', requireAdminAccess('settings.view'), async (_req, res) => {
     try { res.json(await getSettings()); }
     catch (error) { res.status(500).json({ message: error.message }); }
+  });
+
+  router.get('/api/customers', requireAdminAccess('users.view'), async (req, res) => {
+    try {
+      const page = Math.max(1, Math.round(Number(req.query.page || 1)));
+      const limit = Math.max(1, Math.min(100, Math.round(Number(req.query.limit || 20))));
+      const keyword = String(req.query.q || '').trim();
+      const filter = { roles: 'CUSTOMER' };
+      if (keyword) {
+        const regex = { $regex: keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+        filter.$or = [{ fullName: regex }, { name: regex }, { phone: regex }, { email: regex }];
+      }
+      const [customers, total] = await Promise.all([
+        db().collection('users').find(filter).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).toArray(),
+        db().collection('users').countDocuments(filter),
+      ]);
+      const customerIds = customers.map((customer) => customer._id);
+      const phones = customers.map((customer) => customer.phone).filter(Boolean);
+      const trips = customerIds.length ? await db().collection(collectionMap.trips).find({
+        $or: [{ customerId: { $in: customerIds } }, { customerPhone: { $in: phones } }, { 'customerSnapshot.phone': { $in: phones } }],
+      }).sort({ createdAt: -1 }).limit(100).toArray() : [];
+      res.json({
+        customers: customers.map(serializeDoc),
+        trips: trips.map(serializeDoc),
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      });
+    } catch (error) { res.status(500).json({ message: error.message }); }
   });
 
   router.put('/api/data/settings', requireAdminAccess('settings.manage'), async (req, res) => {

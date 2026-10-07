@@ -12,6 +12,8 @@ function safeObjectId(value) { try { return new ObjectId(String(value)); } catch
 function number(value, fallback = 0) { const n = Number(value); return Number.isFinite(n) ? n : fallback; }
 function iso(value) { return value ? new Date(value).toISOString() : null; }
 function cleanLimit(value, fallback = 50, max = 200) { return Math.max(1, Math.min(max, Math.round(number(value, fallback)))); }
+function pageNumber(value) { return Math.max(1, Math.round(number(value, 1))); }
+function pagination(page, limit, total) { return { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) }; }
 function bookingLabel(status) {
   const map = {
     SEARCHING: 'Đang tìm tài xế', DRIVER_ASSIGNED: 'Đã có tài xế', DRIVER_ARRIVING: 'Tài xế đang đến',
@@ -75,14 +77,21 @@ function createAdminOpsRouter({ getDb }) {
   router.get('/bookings', async (req, res) => {
     try {
       const db = getDb();
-      const limit = cleanLimit(req.query.limit, 80, 200);
+      const limit = cleanLimit(req.query.limit, 20, 200);
+      const page = pageNumber(req.query.page);
+      const paged = req.query.page !== undefined;
       const status = String(req.query.status || '').trim().toUpperCase();
+      const serviceCode = String(req.query.serviceCode || '').trim().toUpperCase();
       const q = String(req.query.q || '').trim();
       const filter = {};
       if (status && status !== 'ALL') filter.status = status;
+      if (serviceCode && serviceCode !== 'ALL') filter.serviceCode = serviceCode;
       if (q) filter.$or = [{ bookingCode: { $regex: q, $options: 'i' } }, { 'pickup.address': { $regex: q, $options: 'i' } }, { 'destination.address': { $regex: q, $options: 'i' } }];
-      const rows = await db.collection('bookings').find(filter).sort({ createdAt: -1 }).limit(limit).toArray();
-      return res.json(rows.map((x) => ({
+      const [rows, total] = await Promise.all([
+        db.collection('bookings').find(filter).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).toArray(),
+        paged ? db.collection('bookings').countDocuments(filter) : Promise.resolve(0),
+      ]);
+      const items = rows.map((x) => ({
         id: String(x._id), code: x.bookingCode || String(x._id), status: x.status, statusLabel: bookingLabel(x.status),
         pickup: x.pickup?.address || x.pickup?.addressText || '', destination: x.destination?.address || x.destination?.addressText || '',
         customerId: x.customerId ? String(x.customerId) : null, driverId: x.driverId ? String(x.driverId) : null,
@@ -90,7 +99,8 @@ function createAdminOpsRouter({ getDb }) {
         driverNetAmount: Math.round(number(x.pricing?.driverNetAmount)), platformCommission: Math.round(number(x.pricing?.platformCommission)),
         paymentStatus: x.paymentStatus || null, paymentMethod: x.paymentMethod || null,
         createdAt: iso(x.createdAt), completedAt: iso(x.completedAt), updatedAt: iso(x.updatedAt),
-      })));
+      }));
+      return res.json(paged ? { items, pagination: pagination(page, limit, total) } : items);
     } catch (error) { return res.status(500).json({ message: error.message }); }
   });
 

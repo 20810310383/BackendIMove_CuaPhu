@@ -624,12 +624,29 @@ function createKycRouter({ getDb }) {
     try {
       const db = getDb();
       const status = String(req.query.status || '').toUpperCase();
-      const query = status ? { $or: [{ kycStatus: status }, { approvalStatus: status }] } : {};
-      const drivers = await db.collection('drivers').find(query).sort({ updatedAt: -1 }).limit(200).toArray();
+      const statuses = status.split(',').map((x) => x.trim()).filter(Boolean);
+      const statusQuery = statuses.length ? { $or: [{ kycStatus: { $in: statuses } }, { approvalStatus: { $in: statuses } }] } : {};
+      const keyword = String(req.query.q || '').trim();
+      let query = statusQuery;
+      if (keyword) {
+        const regex = { $regex: keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+        const users = await db.collection('users').find({
+          $or: [{ fullName: regex }, { phone: regex }, { email: regex }],
+        }).project({ _id: 1 }).toArray();
+        const searchQuery = { $or: [{ userId: { $in: users.map((user) => user._id) } }, { _id: safeObjectId(keyword) || null }] };
+        query = Object.keys(statusQuery).length ? { $and: [statusQuery, searchQuery] } : searchQuery;
+      }
+      const page = Math.max(1, Math.round(Number(req.query.page) || 1));
+      const limit = Math.max(1, Math.min(100, Math.round(Number(req.query.limit) || 20)));
+      const paged = req.query.page !== undefined;
+      const [drivers, total] = await Promise.all([
+        db.collection('drivers').find(query).sort({ updatedAt: -1 }).skip((page - 1) * limit).limit(limit).toArray(),
+        paged ? db.collection('drivers').countDocuments(query) : Promise.resolve(0),
+      ]);
       const userIds = drivers.map((d) => d.userId).filter(Boolean);
       const users = await db.collection('users').find({ _id: { $in: userIds } }).toArray();
       const userMap = new Map(users.map((u) => [String(u._id), u]));
-      return res.json(drivers.map((d) => ({
+      const items = drivers.map((d) => ({
         driverId: String(d._id),
         user: publicUser(userMap.get(String(d.userId)) || { _id: d.userId }),
         approvalStatus: d.approvalStatus,
@@ -637,7 +654,8 @@ function createKycRouter({ getDb }) {
         onlineStatus: d.onlineStatus,
         documentsStatus: d.documentsStatus || {},
         updatedAt: d.updatedAt || null,
-      })));
+      }));
+      return res.json(paged ? { items, pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } } : items);
     } catch (error) {
       return res.status(500).json({ message: error.message });
     }

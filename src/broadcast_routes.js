@@ -274,24 +274,28 @@ function createBroadcastRouter({ getDb, getNotifications }) {
 
   router.get('/', permit('broadcast.view'), async (req, res) => {
     try {
-      const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 40));
-      const rows = await getDb().collection('admin_broadcasts')
-        .find({})
-        .sort({ createdAt: -1 })
-        .limit(limit)
-        .toArray();
+      const limit = Math.max(1, Math.min(100, Number(req.query.limit) || 20));
+      const page = Math.max(1, Math.round(Number(req.query.page) || 1));
+      const paged = req.query.page !== undefined;
+      const [rows, total] = await Promise.all([
+        getDb().collection('admin_broadcasts').find({}).sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).toArray(),
+        paged ? getDb().collection('admin_broadcasts').countDocuments({}) : Promise.resolve(0),
+      ]);
 
-      const result = [];
-      for (const row of rows) {
-        result.push({
+      // Stats for each row used to run one after another (up to 40 aggregate
+      // queries for one 20-row page). Run independent rows in parallel so a
+      // page turn waits for the slowest aggregate, not the sum of all of them.
+      const result = await Promise.all(rows.map(async (row) => ({
           ...row,
           _id: String(row._id),
           createdBy: row.createdBy ? String(row.createdBy) : null,
           stats: await broadcastStats(row._id),
-        });
-      }
+      })));
 
-      return res.json(result);
+      return res.json(paged ? {
+        items: result,
+        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
+      } : result);
     } catch (error) {
       return res.status(500).json({ message: error.message });
     }
