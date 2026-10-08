@@ -1514,6 +1514,7 @@ matching = createMatchingEngine({
   getDb: () => db,
   serializeBooking,
   addEvent,
+  getDispatch: () => dispatchEngine,
 });
 matching.start();
 notificationService = createNotificationService({ getDb: () => db });

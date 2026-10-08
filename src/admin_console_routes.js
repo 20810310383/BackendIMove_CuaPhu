@@ -169,6 +169,8 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
       db().collection('merchants').createIndex({createdAt:-1},{name:'idx_merchants_created'}),
       db().collection('orders').createIndex({createdAt:-1},{name:'idx_orders_created'}),
       db().collection('orders').createIndex({status:1,serviceCode:1,createdAt:-1},{name:'idx_orders_status_service_created'}),
+      db().collection('orders').createIndex({status:1,createdAt:-1},{name:'idx_orders_status_created'}),
+      db().collection('orders').createIndex({serviceCode:1,createdAt:-1},{name:'idx_orders_service_created'}),
       db().collection('payments').createIndex({createdAt:-1},{name:'idx_payments_created'}),
       db().collection('admin_broadcasts').createIndex({createdAt:-1},{name:'idx_admin_broadcasts_created'}),
       db().collection('notification_outbox').createIndex({broadcastId:1,status:1},{name:'idx_outbox_broadcast_status'}),

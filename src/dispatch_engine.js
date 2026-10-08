@@ -102,6 +102,38 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     await db.collection('dispatch_configs').updateOne({ key: DEFAULT_CONFIG.key }, { $setOnInsert: { ...DEFAULT_CONFIG, createdAt: new Date(), updatedAt: new Date() } }, { upsert: true });
   }
 
+  // Retry timers are intentionally kept in memory, but the booking state is
+  // persisted.  Rebuild those timers after a Core restart so SEARCHING jobs
+  // cannot remain stuck forever in WAITING_* states.
+  async function resumePendingBookings() {
+    const db = getDb();
+    if (!db) return { resumed: 0, skipped: 'DB_UNAVAILABLE' };
+    const cfg = await getConfig();
+    if (!cfg.enabled) return { resumed: 0, skipped: 'DISPATCH_DISABLED' };
+
+    const now = new Date();
+    const bookings = await db.collection('bookings').find({
+      status: 'SEARCHING',
+      $or: [
+        { dispatchEngine: { $exists: false } },
+        { 'dispatchEngine.status': { $in: ['WAITING_NEXT_ROUND', 'WAITING_DRIVER', 'NEXT_ROUND', 'REQUEUED', 'ADMIN_REQUEUED'] } },
+      ],
+    }).sort({ createdAt: 1 }).limit(200).toArray();
+
+    let resumed = 0;
+    for (const booking of bookings) {
+      const state = String(booking.dispatchEngine?.status || 'NEW');
+      const nextRetryAt = booking.dispatchEngine?.nextRetryAt ? new Date(booking.dispatchEngine.nextRetryAt) : null;
+      const delaySeconds = nextRetryAt && Number.isFinite(nextRetryAt.getTime())
+        ? Math.max(0, Math.ceil((nextRetryAt.getTime() - now.getTime()) / 1000))
+        : 0;
+      const reset = state === 'WAITING_DRIVER' || state === 'REQUEUED' || state === 'ADMIN_REQUEUED' || state === 'NEW';
+      scheduleRetry(booking._id, delaySeconds, { reset });
+      resumed += 1;
+    }
+    return { resumed };
+  }
+
   async function getConfig() {
     const doc = await getDb().collection('dispatch_configs').findOne({ key: DEFAULT_CONFIG.key });
     return normalizeConfig(doc || DEFAULT_CONFIG);
@@ -109,7 +141,24 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
 
   async function saveConfig(raw, adminId = null) {
     const cfg = normalizeConfig(raw || {});
-    await getDb().collection('dispatch_configs').updateOne({ key: DEFAULT_CONFIG.key }, { $set: { ...cfg, key: DEFAULT_CONFIG.key, updatedAt: new Date(), updatedBy: adminId } }, { upsert: true });
+    const changedAt = new Date();
+    const db = getDb();
+    await db.collection('dispatch_configs').updateOne({ key: DEFAULT_CONFIG.key }, { $set: { ...cfg, key: DEFAULT_CONFIG.key, updatedAt: changedAt, updatedBy: adminId } }, { upsert: true });
+    // The two Admin pages expose one on/off switch under different names.
+    // Persist them together so "Auto Matching: ON" can never coexist with a
+    // disabled Live Dispatch engine.
+    await db.collection('matching_policies').updateOne(
+      { key: 'BIKE_MATCHING_POLICY' },
+      {
+        $set: { autoDispatchEnabled: cfg.enabled, updatedAt: changedAt, updatedBy: adminId, dispatchSyncSource: 'V69_DISPATCH_CONFIG' },
+        $setOnInsert: { key: 'BIKE_MATCHING_POLICY', createdAt: changedAt },
+      },
+      { upsert: true },
+    );
+    getMatching()?.invalidateMatchingPolicyCache?.();
+    if (cfg.enabled) setImmediate(() => resumePendingBookings().catch((error) => {
+      console.error('[V6.9 Dispatch] Resume after config change failed:', error.message);
+    }));
     return cfg;
   }
 
@@ -395,6 +444,28 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       setImmediate(() => dispatchWithRetry(booking._id, { reset: true }, attempt).catch(e => console.error('[V6.9 Dispatch retry]', e.message)));
     }
 
+    // Covers timers that were lost on restart and normal jobs whose scheduled
+    // callback was interrupted.  Claim the row before dispatching so the
+    // one-second sweep cannot start the same round twice.
+    const dueJobs = await db.collection('bookings').find({
+      status: 'SEARCHING',
+      'dispatchEngine.status': { $in: ['WAITING_NEXT_ROUND', 'WAITING_DRIVER', 'NEXT_ROUND'] },
+      $or: [
+        { 'dispatchEngine.nextRetryAt': { $lte: now } },
+        { 'dispatchEngine.nextRetryAt': { $exists: false } },
+      ],
+    }).limit(50).toArray();
+    for (const booking of dueJobs) {
+      const previousState = String(booking.dispatchEngine?.status || 'NEXT_ROUND');
+      const claimed = await db.collection('bookings').updateOne(
+        { _id: booking._id, status: 'SEARCHING', 'dispatchEngine.status': previousState },
+        { $set: { 'dispatchEngine.status': 'RESUMING', updatedAt: now } },
+      );
+      if (!claimed.modifiedCount) continue;
+      const reset = previousState === 'WAITING_DRIVER';
+      setImmediate(() => dispatchWithRetry(booking._id, { reset }).catch(e => console.error('[V6.9 Dispatch resume]', e.message)));
+    }
+
     const expired = await db.collection('booking_offers_v69').find({ status: 'PENDING', expiresAt: { $lte: now } }).limit(100).toArray();
     const cfg = await getConfig();
     for (const offer of expired) {
@@ -466,7 +537,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
   async function start() { if (started) return; started = true; sweepTimer = setInterval(() => sweepExpiredOffers().catch(e => console.error('[V6.9 Dispatch sweep]', e.message)), 1000); sweepTimer.unref?.(); }
   function close() { if (sweepTimer) clearInterval(sweepTimer); sweepTimer = null; for (const timer of retryTimers.values()) clearTimeout(timer); retryTimers.clear(); }
 
-  return { databaseReady, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, activeOfferForDriver, getAvailableOffers, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, start, close, addCooldown };
+  return { databaseReady, resumePendingBookings, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, activeOfferForDriver, getAvailableOffers, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, start, close, addCooldown };
 }
 
 module.exports = { createDispatchEngine, DEFAULT_CONFIG, normalizeConfig };

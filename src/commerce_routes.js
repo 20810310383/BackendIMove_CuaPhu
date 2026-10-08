@@ -614,13 +614,79 @@ function createCommerceDriverRouter({ getDb, requireApprovedDriver, findDriverBy
   return r;
 }
 
+const COMMERCE_ADMIN_QUERY_TIMEOUT_MS = 10000;
+const COMMERCE_ADMIN_COUNT_TIMEOUT_MS = 1200;
+const COMMERCE_ADMIN_ORDER_LIST_PROJECTION = {
+  orderCode:1, serviceCode:1, status:1, driverId:1,
+  merchantSnapshot:1, customerSnapshot:1, pickup:1,
+  dispatchStatus:1, dispatchCandidateCount:1, dispatchTriggeredBy:1,
+  total:1, deliveryFee:1, createdAt:1,
+};
+
+function afterDeadline(operation, timeoutMs, message) {
+  let timer = null;
+  return Promise.race([
+    operation,
+    new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+async function listCommerceAdminOrders(db, query, page, limit) {
+  const orders = db.collection('orders');
+  const options = { maxTimeMS: COMMERCE_ADMIN_QUERY_TIMEOUT_MS };
+  const hasFilters = Object.keys(query).length > 0;
+  const rows = await afterDeadline(
+    orders.find(query, { ...options, projection:COMMERCE_ADMIN_ORDER_LIST_PROJECTION })
+      .sort({ createdAt:-1 }).skip((page-1)*limit).limit(limit).toArray(),
+    COMMERCE_ADMIN_QUERY_TIMEOUT_MS,
+    'Commerce orders list deadline exceeded.',
+  );
+
+  // Không để số tổng chặn bảng đơn. Nếu Atlas đang bận đếm, UI vẫn có thể
+  // hiển thị trang hiện tại và người dùng vẫn chuyển được sang trang kế tiếp.
+  const fallbackTotal = (page - 1) * limit + rows.length + (rows.length === limit ? 1 : 0);
+  let total = fallbackTotal;
+  try {
+    total = await afterDeadline(
+      hasFilters ? orders.countDocuments(query, options) : orders.estimatedDocumentCount(options),
+      COMMERCE_ADMIN_COUNT_TIMEOUT_MS,
+      'Commerce orders count deadline exceeded.',
+    );
+  } catch (_) {
+    // Bảng đã có dữ liệu; pagination dùng giá trị tối thiểu thay vì báo lỗi toàn trang.
+  }
+  return { rows, total };
+}
+
+function sendCommerceOrdersError(res, error) {
+  const text = String(error?.message || '');
+  const timedOut = error?.code === 50 || /maxTimeMS|timed out|server selection/i.test(text);
+  return res.status(timedOut ? 503 : 500).json({
+    code: timedOut ? 'COMMERCE_ORDERS_QUERY_TIMEOUT' : 'COMMERCE_ORDERS_QUERY_FAILED',
+    message: timedOut
+      ? 'Dữ liệu đơn dịch vụ đang bận. Vui lòng thử lại sau ít giây.'
+      : 'Không thể tải danh sách đơn dịch vụ. Vui lòng thử lại.',
+  });
+}
+
 function createCommerceAdminRouter({ getDb, getNotifications }) {
   const r=express.Router();const {requireAdmin,permit}=createAdminGuard({getDb});r.use(requireAdmin);
   r.get('/delivery-policy',permit('orders.view'),async(_req,res)=>{try{res.json({policy:await getDeliveryPolicy(getDb())});}catch(e){res.status(500).json({message:e.message});}});
   r.put('/delivery-policy',permit('orders.view'),async(req,res)=>{try{const db=getDb(),now=new Date();const current=await getDeliveryPolicy(db);const policy={standard:normalizeFeeRule(req.body?.standard,current.standard),priority:normalizeFeeRule(req.body?.priority,current.priority),fragile:normalizeFeeRule(req.body?.fragile,current.fragile),cod:{enabled:Boolean(req.body?.cod?.enabled),requireKyc:req.body?.cod?.requireKyc!==false},updatedAt:now,updatedBy:req.admin._id};await db.collection('commerce_settings').updateOne({_id:'DELIVERY_FEE_POLICY'},{$set:policy},{upsert:true});await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'DELIVERY_POLICY_UPDATE',entityType:'COMMERCE_SETTING',entityId:'DELIVERY_FEE_POLICY',after:policy,createdAt:now});res.json({policy});}catch(e){res.status(400).json({message:e.message});}});
   r.get('/merchants',permit('merchants.view'),async(req,res)=>{try{const page=pageNumber(req.query.page),limit=pageLimit(req.query.limit);const [rows,total]=await Promise.all([getDb().collection('merchants').find({}).sort({createdAt:-1}).skip((page-1)*limit).limit(limit).toArray(),getDb().collection('merchants').countDocuments({})]);res.json({merchants:rows.map(serialize),pagination:pageMeta(page,limit,total)});}catch(e){res.status(500).json({message:e.message});}});
   r.put('/merchants/:id',permit('merchants.manage'),async(req,res)=>{try{const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});const patch={};for(const k of ['status','name','commissionRate','categoryCode','merchantType','merchantTypeLabel','categoryName','logoUrl','coverUrl'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id},{$set:patch});await getDb().collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'MERCHANT_UPDATE',entityType:'MERCHANT',entityId:String(_id),after:patch,createdAt:new Date()});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id}))});}catch(e){res.status(400).json({message:e.message});}});
-  r.get('/orders',permit('orders.view'),async(req,res)=>{try{const q={};if(req.query.status)q.status=String(req.query.status).toUpperCase();if(req.query.serviceCode)q.serviceCode=String(req.query.serviceCode).toUpperCase();const page=pageNumber(req.query.page),limit=pageLimit(req.query.limit);const [rows,total]=await Promise.all([getDb().collection('orders').find(q).sort({createdAt:-1}).skip((page-1)*limit).limit(limit).toArray(),getDb().collection('orders').countDocuments(q)]);res.json({orders:rows.map(serialize),pagination:pageMeta(page,limit,total)});}catch(e){res.status(500).json({message:e.message});}});
+  r.get('/orders',permit('orders.view'),async(req,res)=>{
+    try{
+      const q={};
+      if(req.query.status)q.status=String(req.query.status).toUpperCase();
+      if(req.query.serviceCode)q.serviceCode=String(req.query.serviceCode).toUpperCase();
+      const page=pageNumber(req.query.page),limit=pageLimit(req.query.limit);
+      const {rows,total}=await listCommerceAdminOrders(getDb(),q,page,limit);
+      res.json({orders:rows.map(serialize),pagination:pageMeta(page,limit,total)});
+    }catch(e){sendCommerceOrdersError(res,e);}
+  });
   r.get('/orders/:id/candidates',permit('orders.view'),async(req,res)=>{
     try{
       const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Order ID không hợp lệ.'});
