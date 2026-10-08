@@ -701,10 +701,10 @@ app.use('/api/v14/admin/promotions', createPromotionAdminRouter({ getDb:()=>db, 
 app.use('/api/v14/admin/analytics', createAnalyticsAdminRouter({ getDb:()=>db, getAnalytics:()=>analyticsService }));
 
 // V1.6 Multi-service Commerce + Merchant
-app.use('/api/v16/commerce', createCommercePublicRouter({ getDb:()=>db, requireCustomer, getPricing:()=>pricingService, getNotifications:()=>notificationService }));
-app.use('/api/v16/merchant', createMerchantRouter({ getDb:()=>db, getNotifications:()=>notificationService }));
+app.use('/api/v16/commerce', createCommercePublicRouter({ getDb:()=>db, requireCustomer, getPricing:()=>pricingService, getNotifications:()=>notificationService, getMatching:()=>matching }));
+app.use('/api/v16/merchant', createMerchantRouter({ getDb:()=>db, getNotifications:()=>notificationService, getMatching:()=>matching }));
 app.use('/api/v16/driver', createCommerceDriverRouter({ getDb:()=>db, requireApprovedDriver, findDriverByPhone, getNotifications:()=>notificationService }));
-app.use('/api/v16/admin/commerce', createCommerceAdminRouter({ getDb:()=>db, getNotifications:()=>notificationService }));
+app.use('/api/v16/admin/commerce', createCommerceAdminRouter({ getDb:()=>db, getNotifications:()=>notificationService, getMatching:()=>matching }));
 
 // V7.2 Driver Experience API
 app.use('/api/v72/driver', requireApprovedDriver, createDriverExperienceRouter({ getDb:()=>db, findDriverByPhone }));
@@ -1533,6 +1533,7 @@ dispatchEngine.start();
 commerceDispatchWorker = createCommerceDispatchWorker({
   getDb: () => db,
   getNotifications: () => notificationService,
+  getMatching: () => matching,
   intervalMs: Number(process.env.COMMERCE_DISPATCH_INTERVAL_MS || 10000),
 });
 commerceDispatchWorker.start();

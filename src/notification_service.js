@@ -305,11 +305,24 @@ function createNotificationService({ getDb }) {
       return;
     }
 
-    const tokens = await db.collection('device_tokens').find({
-      userId: outbox.targetId,
-      userType: outbox.targetType,
-      enabled: true,
-    }).toArray();
+    // Current clients register with the canonical dispatch recipient ID
+    // (Driver _id for drivers). Older Driver builds registered with their
+    // User _id via /api/v6/devices/register. Keep both registrations valid so
+    // an assignment is not silently lost while those apps upgrade.
+    const tokenFilters = [
+      { userId: outbox.targetId, userType: outbox.targetType, enabled: true },
+      { userId: outbox.targetId, status: 'ACTIVE' },
+    ];
+    if (outbox.targetType === 'DRIVER') {
+      const driver = await db.collection('drivers').findOne({ _id: oid(outbox.targetId) }, { projection: { userId: 1 } });
+      if (driver?.userId) {
+        tokenFilters.push(
+          { userId: driver.userId, enabled: true },
+          { userId: driver.userId, status: 'ACTIVE' },
+        );
+      }
+    }
+    const tokens = await db.collection('device_tokens').find({ $or: tokenFilters }).toArray();
 
     // MongoDB is the source of truth for notifications in iMove 1.6.0.
     // FCM is only an optional wake-up channel. A missing token or missing

@@ -30,6 +30,22 @@ function cleanText(value, max = 1000) {
 function createPlatformService({ getDb, getClient, getMatching }) {
   const router = express.Router();
 
+  // Notifications created by the dispatch service target a Driver document,
+  // while older Driver builds registered/read notifications using the User
+  // document. Resolve both IDs here so a commerce dispatch is never hidden
+  // from an installed Driver app during the client migration.
+  async function notificationRecipients(user) {
+    const db = getDb();
+    const roles = Array.isArray(user?.roles)
+      ? user.roles.map((role) => String(role || '').toUpperCase())
+      : [];
+    if (roles.includes('DRIVER')) {
+      const driver = await db.collection('drivers').findOne({ userId: user._id });
+      if (driver) return { userIds: [user._id, driver._id], pushTargetId: driver._id, userType: 'DRIVER' };
+    }
+    return { userIds: [user._id], pushTargetId: user._id, userType: 'CUSTOMER' };
+  }
+
   const config = {
     demoTopupEnabled: process.env.NODE_ENV !== 'production' && String(process.env.V64_DEMO_TOPUP_ENABLED || 'false').toLowerCase() === 'true',
     demoTopupMax: Math.max(10000, number(process.env.V64_DEMO_TOPUP_MAX, 500000)),
@@ -952,8 +968,14 @@ function createPlatformService({ getDb, getClient, getMatching }) {
   // ----------------------- V6.1: notifications + safety -----------------------
   router.get('/notifications', authenticate, async (req, res) => {
     const db = getDb();
+    const recipients = await notificationRecipients(req.v64.user);
     const items = await db.collection('notifications')
-      .find({ userId: req.v64.user._id })
+      .find({
+        $or: [
+          { userId: { $in: recipients.userIds } },
+          { targetId: { $in: recipients.userIds } },
+        ],
+      })
       .sort({ createdAt: -1 })
       .limit(100)
       .toArray();
@@ -963,8 +985,15 @@ function createPlatformService({ getDb, getClient, getMatching }) {
   router.post('/notifications/:id/read', authenticate, async (req, res) => {
     const id = safeObjectId(req.params.id);
     if (!id) return res.status(400).json({ message: 'Notification id không hợp lệ.' });
+    const recipients = await notificationRecipients(req.v64.user);
     await getDb().collection('notifications').updateOne(
-      { _id: id, userId: req.v64.user._id },
+      {
+        _id: id,
+        $or: [
+          { userId: { $in: recipients.userIds } },
+          { targetId: { $in: recipients.userIds } },
+        ],
+      },
       { $set: { readAt: new Date() } },
     );
     return res.json({ ok: true });
@@ -974,13 +1003,16 @@ function createPlatformService({ getDb, getClient, getMatching }) {
     const token = cleanText(req.body?.token, 1000);
     if (!token) return res.status(400).json({ message: 'Thiếu device token.' });
     const platform = cleanText(req.body?.platform, 32) || 'UNKNOWN';
+    const recipients = await notificationRecipients(req.v64.user);
     await getDb().collection('device_tokens').updateOne(
       { token },
       {
         $set: {
           token,
-          userId: req.v64.user._id,
+          userId: recipients.pushTargetId,
+          userType: recipients.userType,
           platform,
+          enabled: true,
           status: 'ACTIVE',
           updatedAt: new Date(),
         },
