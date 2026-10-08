@@ -188,7 +188,10 @@ function createFundTopupAdminRouter({getDb}){
   const {requireAdmin,permit}=createAdminGuard({getDb});
   r.use(requireAdmin);
 
-  r.get('/config',permit('settings.view'),async(_req,res)=>{
+  const canViewFunds=permit(['settings.view','payments.view','settlements.view']);
+  const canReviewFunds=permit(['settings.manage','payments.manage','settlements.manage']);
+
+  r.get('/config',canViewFunds,async(_req,res)=>{
     const doc=await getDb().collection('fund_settings').findOne({_id:'BANK_TRANSFER'});
     return res.json({bank:publicBankConfig(doc||{}),minimumAmountVnd:Number(doc?.minimumAmountVnd||50000)});
   });
@@ -219,7 +222,7 @@ function createFundTopupAdminRouter({getDb}){
     await db.collection('fund_settings').updateOne({_id:'BANK_TRANSFER'},{$set:{qrStoredName:req.file.filename,qrImageUrl:'',updatedAt:now,updatedBy:req.admin._id},$setOnInsert:{createdAt:now}},{upsert:true});
     return res.json({ok:true,qrImageUrl:'/api/v171/funds/qr'});
   });
-  r.get('/requests',permit('settings.view'),async(req,res)=>{
+  r.get('/requests',canViewFunds,async(req,res)=>{
     const q={};
     const status=clean(req.query.status,40).toUpperCase();
     const actorType=clean(req.query.actorType,20).toUpperCase();
@@ -228,7 +231,7 @@ function createFundTopupAdminRouter({getDb}){
     const rows=await getDb().collection('fund_topup_requests').find(q).sort({createdAt:-1}).limit(500).toArray();
     return res.json({requests:rows.map(serialize)});
   });
-  r.get('/requests/:id/receipt',permit('settings.view'),async(req,res)=>{
+  r.get('/requests/:id/receipt',canViewFunds,async(req,res)=>{
     const id=oid(req.params.id);
     const row=id?await getDb().collection('fund_topup_requests').findOne({_id:id}):null;
     if(!row?.receiptStoredName)return res.status(404).end();
@@ -237,12 +240,13 @@ function createFundTopupAdminRouter({getDb}){
     res.setHeader('Content-Type',row.receiptMime||'application/octet-stream');
     return res.sendFile(file);
   });
-  r.post('/requests/:id/approve',permit('settings.manage'),async(req,res)=>{
+  r.post('/requests/:id/approve',canReviewFunds,async(req,res)=>{
     const db=getDb(),id=oid(req.params.id);
     const row=id?await db.collection('fund_topup_requests').findOne({_id:id}):null;
     if(!row)return res.status(404).json({message:'Không tìm thấy yêu cầu.'});
     if(row.status==='APPROVED')return res.json({request:serialize(row),duplicate:true});
-    if(!['PENDING_REVIEW','WAITING_TRANSFER'].includes(row.status))return res.status(409).json({message:'Trạng thái yêu cầu không thể duyệt.'});
+    if(row.status!=='PENDING_REVIEW')return res.status(409).json({message:'Yêu cầu phải ở trạng thái chờ duyệt mới có thể duyệt.'});
+    if(!row.receiptStoredName)return res.status(409).json({message:'Tài xế/Merchant chưa tải biên lai. Không thể duyệt yêu cầu này.'});
     const now=new Date();
     if(row.actorType==='DRIVER'){
       const points=Math.max(1,Math.floor(Number(row.amountVnd||0)/pointValueVnd()));
@@ -278,10 +282,12 @@ function createFundTopupAdminRouter({getDb}){
     await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'FUND_TOPUP_APPROVE',entityType:'FUND_TOPUP',entityId:String(row._id),after:{actorType:row.actorType,amountVnd:row.amountVnd,requestCode:row.requestCode},createdAt:now});
     return res.json({request:serialize(await db.collection('fund_topup_requests').findOne({_id:row._id}))});
   });
-  r.post('/requests/:id/reject',permit('settings.manage'),async(req,res)=>{
+  r.post('/requests/:id/reject',canReviewFunds,async(req,res)=>{
     const db=getDb(),id=oid(req.params.id),now=new Date();
     const row=id?await db.collection('fund_topup_requests').findOne({_id:id}):null;
     if(!row)return res.status(404).json({message:'Không tìm thấy yêu cầu.'});
+    if(row.status==='REJECTED')return res.json({request:serialize(row),duplicate:true});
+    if(!['PENDING_REVIEW','WAITING_TRANSFER'].includes(row.status))return res.status(409).json({message:'Chỉ có thể từ chối yêu cầu đang chờ xử lý.'});
     const reason=clean(req.body?.reason,500)||'Không đối chiếu được giao dịch.';
     await db.collection('fund_topup_requests').updateOne({_id:id},{$set:{status:'REJECTED',rejectReason:reason,rejectedAt:now,rejectedBy:req.admin._id,updatedAt:now}});
     return res.json({request:serialize(await db.collection('fund_topup_requests').findOne({_id:id}))});
