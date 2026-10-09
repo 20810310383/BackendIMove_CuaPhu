@@ -11,7 +11,6 @@ function normalizePhone(value) {
 function normalizeSpeedSmsPhone(value) {
   const phone = normalizePhone(value);
   if (!phone) return '';
-  // SpeedSMS supports international numbers. For VN we normalize 09xx -> 849xx.
   if (phone.startsWith('84')) return phone;
   if (phone.startsWith('0')) return `84${phone.slice(1)}`;
   return phone;
@@ -26,11 +25,7 @@ function maskPhone(phone) {
 async function readProviderResponse(response) {
   const text = await response.text();
   let json = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch (_) {
-    json = null;
-  }
+  try { json = text ? JSON.parse(text) : null; } catch (_) { json = null; }
   return { text, json };
 }
 
@@ -59,33 +54,33 @@ async function postJson(url, payload, token, timeoutMs) {
   }
 }
 
-async function sendViaSpeedSms({ phone, message }) {
-  const accessToken = clean(process.env.SPEEDSMS_ACCESS_TOKEN, 1000);
-  if (!accessToken) throw new Error('SPEEDSMS_ACCESS_TOKEN chưa được cấu hình.');
+function speedSmsPayload(phone, message, smsType, sender) {
+  const payload = {
+    to: [normalizeSpeedSmsPhone(phone)],
+    content: message,
+    sms_type: smsType,
+  };
 
-  const url = clean(process.env.SPEEDSMS_API_URL, 500);
-  if (!url) throw new Error('SPEEDSMS_API_URL chưa được cấu hình.');
-  const smsType = Number(process.env.SPEEDSMS_SMS_TYPE || 2);
-  const sender = clean(process.env.SPEEDSMS_SENDER || '', 80);
-  const timeoutMs = Math.max(2000, Number(process.env.SMS_TIMEOUT_MS || 8000));
-
-  if (![2, 3, 4, 5].includes(smsType)) {
-    throw new Error('SPEEDSMS_SMS_TYPE phải là 2, 3, 4 hoặc 5.');
+  // SpeedSMS hiện tại minh họa sms_type=2 với sender="".
+  // type 4 dùng brand mặc định Notify/Verify và cũng không cần brandname riêng.
+  // type 3/5 bắt buộc sender thật.
+  if (smsType === 3 || smsType === 5) {
+    if (!sender) {
+      throw new Error(`SPEEDSMS_SENDER bắt buộc khi SPEEDSMS_SMS_TYPE=${smsType}.`);
+    }
+    payload.sender = sender;
+  } else {
+    payload.sender = '';
   }
 
+  return payload;
+}
+
+async function callSpeedSms({ url, accessToken, timeoutMs, payload }) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    // SpeedSMS official API uses HTTP Basic Authentication:
-    // username = access token, password = x.
     const basic = Buffer.from(`${accessToken}:x`, 'utf8').toString('base64');
-    const payload = {
-      to: [normalizeSpeedSmsPhone(phone)],
-      content: message,
-      sms_type: smsType,
-      ...(sender ? { sender } : {}),
-    };
-
     const response = await fetch(url, {
       method: 'POST',
       headers: {
@@ -100,6 +95,7 @@ async function sendViaSpeedSms({ phone, message }) {
     if (!response.ok) {
       const error = new Error(`SpeedSMS trả HTTP ${response.status}.`);
       error.providerBody = text.slice(0, 400);
+      error.providerJson = json;
       throw error;
     }
     if (!json || json.status !== 'success' || String(json.code) !== '00') {
@@ -107,19 +103,70 @@ async function sendViaSpeedSms({ phone, message }) {
       const messageText = json?.message || 'SpeedSMS gửi SMS thất bại.';
       const error = new Error(`SpeedSMS lỗi ${code}: ${messageText}`);
       error.providerBody = text.slice(0, 400);
+      error.providerJson = json;
       throw error;
     }
-
-    return {
-      delivered: true,
-      provider: 'SPEEDSMS',
-      transactionId: json?.data?.tranId ?? null,
-      totalSMS: json?.data?.totalSMS ?? null,
-      totalPrice: json?.data?.totalPrice ?? null,
-    };
+    return json;
   } finally {
     clearTimeout(timer);
   }
+}
+
+function shouldTryFallback(error) {
+  const msg = String(error?.message || '').toLowerCase();
+  const code = String(error?.providerJson?.code || '');
+  return msg.includes('sender not found') || msg.includes('sender') || code === '101';
+}
+
+async function sendViaSpeedSms({ phone, message, purpose = 'PHONE_VERIFY' }) {
+  const accessToken = clean(process.env.SPEEDSMS_ACCESS_TOKEN, 1000);
+  if (!accessToken) throw new Error('SPEEDSMS_ACCESS_TOKEN chưa được cấu hình.');
+
+  const url = clean(
+    process.env.SPEEDSMS_API_URL || 'https://api.speedsms.vn/index.php/sms/send',
+    500,
+  );
+  const sender = clean(process.env.SPEEDSMS_SENDER || '', 80);
+  const timeoutMs = Math.max(2000, Number(process.env.SMS_TIMEOUT_MS || 8000));
+
+  // OTP ưu tiên type 4 (Notify/Verify mặc định của SpeedSMS).
+  // Nếu muốn ép loại khác có thể đặt SPEEDSMS_OTP_SMS_TYPE.
+  const configuredOtpType = Number(process.env.SPEEDSMS_OTP_SMS_TYPE || 4);
+  const configuredGeneralType = Number(process.env.SPEEDSMS_SMS_TYPE || 2);
+  const primaryType = /OTP|VERIFY|REGISTER/i.test(String(purpose || ''))
+    ? configuredOtpType
+    : configuredGeneralType;
+
+  if (![2, 3, 4, 5, 6].includes(primaryType)) {
+    throw new Error('SpeedSMS sms_type không hợp lệ.');
+  }
+
+  const attemptTypes = [primaryType];
+  // Fallback cho tài khoản SpeedSMS chưa dùng được Notify/Verify hoặc CSKH.
+  if (primaryType === 4) attemptTypes.push(2);
+  else if (primaryType === 2) attemptTypes.push(4);
+
+  let lastError = null;
+  for (let i = 0; i < attemptTypes.length; i += 1) {
+    const smsType = attemptTypes[i];
+    try {
+      const payload = speedSmsPayload(phone, message, smsType, sender);
+      const json = await callSpeedSms({ url, accessToken, timeoutMs, payload });
+      return {
+        delivered: true,
+        provider: 'SPEEDSMS',
+        smsType,
+        transactionId: json?.data?.tranId ?? null,
+        totalSMS: json?.data?.totalSMS ?? null,
+        totalPrice: json?.data?.totalPrice ?? null,
+      };
+    } catch (error) {
+      lastError = error;
+      if (i === attemptTypes.length - 1 || !shouldTryFallback(error)) throw error;
+    }
+  }
+
+  throw lastError || new Error('SpeedSMS gửi OTP thất bại.');
 }
 
 async function sendOtpSms({ phone, otp, purpose = 'PHONE_VERIFY' }) {

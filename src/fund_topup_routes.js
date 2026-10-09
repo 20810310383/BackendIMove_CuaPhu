@@ -67,11 +67,50 @@ function makeStorage(folder){
   });
 }
 function imageFilter(_req,file,cb){
-  if(/^image\/(jpeg|png|webp|heic|heif)$/i.test(file.mimetype))return cb(null,true);
+  const mime=String(file?.mimetype||'').toLowerCase();
+  const ext=String(path.extname(file?.originalname||'')||'').toLowerCase();
+  const imageMime=/^image\/(jpeg|jpg|png|webp|heic|heif)$/i.test(mime);
+  const imageExt=['.jpg','.jpeg','.png','.webp','.heic','.heif'].includes(ext);
+  // Dart http.MultipartFile.fromPath may send application/octet-stream.
+  // In that case only accept known image file extensions.
+  if(imageMime||(mime==='application/octet-stream'&&imageExt))return cb(null,true);
   cb(new Error('Chỉ chấp nhận ảnh JPEG/PNG/WEBP/HEIC.'));
+}
+function singleUploadJson(upload,field){
+  return (req,res,next)=>upload.single(field)(req,res,(error)=>{
+    if(!error)return next();
+    const status=error?.code==='LIMIT_FILE_SIZE'?413:400;
+    const message=error?.code==='LIMIT_FILE_SIZE'
+      ? 'Ảnh tải lên quá lớn.'
+      : (error?.message||'Không thể tải ảnh lên.');
+    return res.status(status).json({ok:false,message,code:error?.code||'UPLOAD_ERROR'});
+  });
 }
 const receiptUpload=multer({storage:makeStorage(path.resolve(__dirname,'../storage/fund-receipts')),limits:{fileSize:8*1024*1024},fileFilter:imageFilter});
 const qrUpload=multer({storage:makeStorage(path.resolve(__dirname,'../storage/fund-qr')),limits:{fileSize:5*1024*1024},fileFilter:imageFilter});
+const receiptDir=path.resolve(__dirname,'../storage/fund-receipts');
+fs.mkdirSync(receiptDir,{recursive:true});
+const rawReceiptBody=express.raw({
+  type:['image/jpeg','image/jpg','image/png','image/webp','image/heic','image/heif','application/octet-stream'],
+  limit:'2mb',
+});
+function rawReceiptJson(req,res,next){
+  rawReceiptBody(req,res,(error)=>{
+    if(!error)return next();
+    const status=error?.type==='entity.too.large'?413:400;
+    return res.status(status).json({ok:false,message:status===413?'Ảnh bill quá lớn. Tối đa 2 MB.':(error?.message||'Không đọc được ảnh bill.')});
+  });
+}
+function receiptExt(name,mime){
+  const ext=String(path.extname(name||'')||'').toLowerCase();
+  if(['.jpg','.jpeg','.png','.webp','.heic','.heif'].includes(ext))return ext;
+  const m=String(mime||'').toLowerCase();
+  if(m.includes('png'))return '.png';
+  if(m.includes('webp'))return '.webp';
+  if(m.includes('heic'))return '.heic';
+  if(m.includes('heif'))return '.heif';
+  return '.jpg';
+}
 
 async function actorContext(db,user){
   const roles=Array.isArray(user.roles)?user.roles.map(x=>String(x).toUpperCase()):[];
@@ -159,7 +198,7 @@ function createFundTopupRouter({getDb}){
     }catch(e){return res.status(Number(e.httpStatus)||500).json({message:e.message});}
   });
 
-  r.post('/requests/:id/receipt',receiptUpload.single('receipt'),async(req,res)=>{
+  r.post('/requests/:id/receipt',singleUploadJson(receiptUpload,'receipt'),async(req,res)=>{
     try{
       const db=getDb(), id=oid(req.params.id);
       if(!id)return res.status(400).json({message:'ID không hợp lệ.'});
@@ -180,6 +219,40 @@ function createFundTopupRouter({getDb}){
       return res.json({request:serialize(updated)});
     }catch(e){return res.status(500).json({message:e.message});}
   });
+
+  // Fallback upload không dùng multipart/multer. Flutter gửi trực tiếp bytes ảnh.
+  // Endpoint này tránh trường hợp proxy/multer trả HTML 500 khi parse multipart.
+  r.post('/requests/:id/receipt-binary',rawReceiptJson,async(req,res)=>{
+    let storedName='';
+    try{
+      const db=getDb(), id=oid(req.params.id);
+      if(!id)return res.status(400).json({ok:false,message:'ID không hợp lệ.'});
+      const row=await db.collection('fund_topup_requests').findOne({_id:id,actorUserId:req.auth.user._id});
+      if(!row)return res.status(404).json({ok:false,message:'Không tìm thấy yêu cầu.'});
+      const bytes=Buffer.isBuffer(req.body)?req.body:Buffer.alloc(0);
+      if(!bytes.length)return res.status(400).json({ok:false,message:'File bill rỗng.'});
+      if(bytes.length>2*1024*1024)return res.status(413).json({ok:false,message:'Ảnh bill quá lớn. Tối đa 2 MB.'});
+      const originalName=clean(req.get('x-file-name')||'receipt.jpg',240);
+      const ext=receiptExt(originalName,req.get('content-type'));
+      storedName=`${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
+      await fs.promises.writeFile(path.join(receiptDir,storedName),bytes);
+      const now=new Date();
+      await db.collection('fund_topup_requests').updateOne({_id:id},{
+        $set:{
+          receiptStoredName:storedName,
+          receiptOriginalName:originalName,
+          receiptMime:String(req.get('content-type')||'application/octet-stream').split(';')[0],
+          status:'PENDING_REVIEW',submittedAt:now,updatedAt:now,
+        }
+      });
+      const updated=await db.collection('fund_topup_requests').findOne({_id:id});
+      return res.json({ok:true,request:serialize(updated)});
+    }catch(e){
+      if(storedName)await fs.promises.unlink(path.join(receiptDir,path.basename(storedName))).catch(()=>{});
+      console.error('[fund receipt-binary]',e);
+      return res.status(500).json({ok:false,message:e.message||'Không thể lưu bill.'});
+    }
+  });
   return r;
 }
 
@@ -188,10 +261,7 @@ function createFundTopupAdminRouter({getDb}){
   const {requireAdmin,permit}=createAdminGuard({getDb});
   r.use(requireAdmin);
 
-  const canViewFunds=permit(['settings.view','payments.view','settlements.view']);
-  const canReviewFunds=permit(['settings.manage','payments.manage','settlements.manage']);
-
-  r.get('/config',canViewFunds,async(_req,res)=>{
+  r.get('/config',permit('settings.view'),async(_req,res)=>{
     const doc=await getDb().collection('fund_settings').findOne({_id:'BANK_TRANSFER'});
     return res.json({bank:publicBankConfig(doc||{}),minimumAmountVnd:Number(doc?.minimumAmountVnd||50000)});
   });
@@ -212,7 +282,7 @@ function createFundTopupAdminRouter({getDb}){
     const doc=await getDb().collection('fund_settings').findOne({_id:'BANK_TRANSFER'});
     return res.json({bank:publicBankConfig(doc),minimumAmountVnd:doc.minimumAmountVnd});
   });
-  r.post('/config/qr',permit('settings.manage'),qrUpload.single('qr'),async(req,res)=>{
+  r.post('/config/qr',permit('settings.manage'),singleUploadJson(qrUpload,'qr'),async(req,res)=>{
     if(!req.file)return res.status(400).json({message:'Vui lòng chọn ảnh QR.'});
     const db=getDb(),now=new Date();
     const old=await db.collection('fund_settings').findOne({_id:'BANK_TRANSFER'});
@@ -222,7 +292,7 @@ function createFundTopupAdminRouter({getDb}){
     await db.collection('fund_settings').updateOne({_id:'BANK_TRANSFER'},{$set:{qrStoredName:req.file.filename,qrImageUrl:'',updatedAt:now,updatedBy:req.admin._id},$setOnInsert:{createdAt:now}},{upsert:true});
     return res.json({ok:true,qrImageUrl:'/api/v171/funds/qr'});
   });
-  r.get('/requests',canViewFunds,async(req,res)=>{
+  r.get('/requests',permit('settings.view'),async(req,res)=>{
     const q={};
     const status=clean(req.query.status,40).toUpperCase();
     const actorType=clean(req.query.actorType,20).toUpperCase();
@@ -231,7 +301,7 @@ function createFundTopupAdminRouter({getDb}){
     const rows=await getDb().collection('fund_topup_requests').find(q).sort({createdAt:-1}).limit(500).toArray();
     return res.json({requests:rows.map(serialize)});
   });
-  r.get('/requests/:id/receipt',canViewFunds,async(req,res)=>{
+  r.get('/requests/:id/receipt',permit('settings.view'),async(req,res)=>{
     const id=oid(req.params.id);
     const row=id?await getDb().collection('fund_topup_requests').findOne({_id:id}):null;
     if(!row?.receiptStoredName)return res.status(404).end();
@@ -240,13 +310,12 @@ function createFundTopupAdminRouter({getDb}){
     res.setHeader('Content-Type',row.receiptMime||'application/octet-stream');
     return res.sendFile(file);
   });
-  r.post('/requests/:id/approve',canReviewFunds,async(req,res)=>{
+  r.post('/requests/:id/approve',permit('settings.manage'),async(req,res)=>{
     const db=getDb(),id=oid(req.params.id);
     const row=id?await db.collection('fund_topup_requests').findOne({_id:id}):null;
     if(!row)return res.status(404).json({message:'Không tìm thấy yêu cầu.'});
     if(row.status==='APPROVED')return res.json({request:serialize(row),duplicate:true});
-    if(row.status!=='PENDING_REVIEW')return res.status(409).json({message:'Yêu cầu phải ở trạng thái chờ duyệt mới có thể duyệt.'});
-    if(!row.receiptStoredName)return res.status(409).json({message:'Tài xế/Merchant chưa tải biên lai. Không thể duyệt yêu cầu này.'});
+    if(!['PENDING_REVIEW','WAITING_TRANSFER'].includes(row.status))return res.status(409).json({message:'Trạng thái yêu cầu không thể duyệt.'});
     const now=new Date();
     if(row.actorType==='DRIVER'){
       const points=Math.max(1,Math.floor(Number(row.amountVnd||0)/pointValueVnd()));
@@ -282,12 +351,10 @@ function createFundTopupAdminRouter({getDb}){
     await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'FUND_TOPUP_APPROVE',entityType:'FUND_TOPUP',entityId:String(row._id),after:{actorType:row.actorType,amountVnd:row.amountVnd,requestCode:row.requestCode},createdAt:now});
     return res.json({request:serialize(await db.collection('fund_topup_requests').findOne({_id:row._id}))});
   });
-  r.post('/requests/:id/reject',canReviewFunds,async(req,res)=>{
+  r.post('/requests/:id/reject',permit('settings.manage'),async(req,res)=>{
     const db=getDb(),id=oid(req.params.id),now=new Date();
     const row=id?await db.collection('fund_topup_requests').findOne({_id:id}):null;
     if(!row)return res.status(404).json({message:'Không tìm thấy yêu cầu.'});
-    if(row.status==='REJECTED')return res.json({request:serialize(row),duplicate:true});
-    if(!['PENDING_REVIEW','WAITING_TRANSFER'].includes(row.status))return res.status(409).json({message:'Chỉ có thể từ chối yêu cầu đang chờ xử lý.'});
     const reason=clean(req.body?.reason,500)||'Không đối chiếu được giao dịch.';
     await db.collection('fund_topup_requests').updateOne({_id:id},{$set:{status:'REJECTED',rejectReason:reason,rejectedAt:now,rejectedBy:req.admin._id,updatedAt:now}});
     return res.json({request:serialize(await db.collection('fund_topup_requests').findOne({_id:id}))});
