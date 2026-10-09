@@ -77,10 +77,42 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     return out;
   }
 
+  function publicDriverUser(user) {
+    if (!user) return null;
+    return {
+      id: String(user._id),
+      fullName: user.fullName || user.name || null,
+      name: user.name || user.fullName || null,
+      phone: user.phone || null,
+      email: user.email || null,
+      avatarUrl: user.avatarUrl || user.avatar?.url || null,
+    };
+  }
+
   async function getArrayData(key) {
     const collection = db().collection(collectionMap[key]);
     const filter = key === 'customers' && collectionMap.customers === 'users' ? { roles: 'CUSTOMER' } : {};
     const rows = await collection.find(filter).sort({ createdAt: -1, _id: -1 }).toArray();
+
+    // Driver records only keep userId.  Enriching each row here keeps the
+    // legacy Driver screen in sync with the canonical users collection.
+    if (key === 'drivers') {
+      const rawUserIds = [...new Set(rows.map((row) => String(row.userId || '')).filter(Boolean))];
+      const userLookupIds = rawUserIds.flatMap((id) => {
+        const objectId = objectIdOrNull(id);
+        return objectId ? [id, objectId] : [id];
+      });
+      const users = userLookupIds.length
+        ? await db().collection('users').find({ _id: { $in: userLookupIds } }).project({ fullName: 1, name: 1, phone: 1, email: 1, avatar: 1, avatarUrl: 1 }).toArray()
+        : [];
+      const userById = new Map(users.map((user) => [String(user._id), user]));
+
+      return rows.map((driver) => ({
+        ...serializeDoc(driver),
+        user: publicDriverUser(userById.get(String(driver.userId || ''))),
+      }));
+    }
+
     return rows.map(serializeDoc);
   }
 
