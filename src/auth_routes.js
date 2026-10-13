@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { sendOtpSms, assertOtpThrottle } = require('./otp_delivery_service');
+const { getAppFeatureSettings } = require('./app_feature_settings');
 const { ObjectId } = require('mongodb');
 
 const router = express.Router();
@@ -527,7 +528,7 @@ function createAuthRouter({
         }
 
         const verificationToken = String(req.body?.verificationToken || '').trim();
-        const requireOtp = String(process.env.CUSTOMER_REGISTER_REQUIRE_OTP || 'true').toLowerCase() !== 'false';
+        const requireOtp = (await getAppFeatureSettings(db)).otpVerificationEnabled;
         if (requireOtp) {
           if (!verificationToken) {
             return res.status(400).json({ code: 'OTP_REQUIRED', message: 'Vui lòng xác thực OTP số điện thoại trước khi đăng ký.' });
@@ -538,7 +539,7 @@ function createAuthRouter({
               issuer: 'th79-imove',
               audience: 'th79-imove-apps',
             });
-            if (verified?.kind !== 'OTP_VERIFICATION' || normalizePhone(verified?.phone) !== phone || !['CUSTOMER_PHONE_VERIFY','PHONE_VERIFY'].includes(String(verified?.purpose || '').toUpperCase())) {
+            if (verified?.kind !== 'OTP_VERIFICATION' || verified?.bypassedBecauseOtpDisabled === true || normalizePhone(verified?.phone) !== phone || !['CUSTOMER_PHONE_VERIFY','PHONE_VERIFY'].includes(String(verified?.purpose || '').toUpperCase())) {
               return res.status(400).json({ code: 'OTP_INVALID', message: 'Phiên xác thực OTP không hợp lệ.' });
             }
           } catch (_) {
@@ -948,6 +949,10 @@ function createAuthRouter({
       if (!allowed.has(purpose)) {
         return res.status(400).json({ message: 'Mục đích OTP không hợp lệ.' });
       }
+      if (['PHONE_VERIFY', 'CUSTOMER_PHONE_VERIFY', 'MERCHANT_PHONE_VERIFY'].includes(purpose) &&
+          !(await getAppFeatureSettings(db)).otpVerificationEnabled) {
+        return res.status(409).json({ code: 'OTP_DISABLED', message: 'OTP đăng ký đã được tắt. Vui lòng đăng ký trực tiếp.' });
+      }
       await assertOtpThrottle(db, { phone, purpose });
       const otp = generateOtp();
       const createdAt = now();
@@ -1025,6 +1030,9 @@ function createAuthRouter({
       try {
         const db =
           getDb();
+        if (!(await getAppFeatureSettings(db)).otpVerificationEnabled) {
+          return res.status(409).json({ code: 'OTP_DISABLED', message: 'OTP đăng ký tài xế đã tắt. Vui lòng đăng ký trực tiếp.' });
+        }
 
         const phone =
           normalizePhone(
@@ -1215,15 +1223,12 @@ function createAuthRouter({
           }
         }
 
+        const requireOtp = (await getAppFeatureSettings(db)).otpVerificationEnabled;
         if (
           fullName.length < 2 ||
-          !validatePhone(
-            phone,
-          ) ||
+          !validatePhone(phone) ||
           password.length < 6 ||
-          !/^\d{6}$/.test(
-            otpCode,
-          )
+          (requireOtp && !/^\d{6}$/.test(otpCode))
         ) {
           return res
             .status(400)
@@ -1233,40 +1238,19 @@ function createAuthRouter({
             });
         }
 
-        const otp =
-          await db
-            .collection(
-              'otp_verifications',
-            )
-            .findOne(
-              {
-                phone,
+        const otp = requireOtp
+          ? await db.collection('otp_verifications').findOne({
+              phone,
+              purpose: 'DRIVER_REGISTER',
+              codeHash: sha256(otpCode),
+              usedAt: null,
+              cancelledAt: { $exists: false },
+              bypassedBecauseOtpDisabled: { $ne: true },
+              expiresAt: { $gt: now() },
+            }, { sort: { createdAt: -1 } })
+          : null;
 
-                purpose:
-                  'DRIVER_REGISTER',
-
-                codeHash:
-                  sha256(
-                    otpCode,
-                  ),
-
-                usedAt:
-                  null,
-
-                expiresAt: {
-                  $gt:
-                    now(),
-                },
-              },
-              {
-                sort: {
-                  createdAt:
-                    -1,
-                },
-              },
-            );
-
-        if (!otp) {
+        if (requireOtp && !otp) {
           return res
             .status(400)
             .json({
@@ -1448,22 +1432,12 @@ function createAuthRouter({
           };
         }
 
-        await db
-          .collection(
-            'otp_verifications',
-          )
-          .updateOne(
-            {
-              _id:
-                otp._id,
-            },
-            {
-              $set: {
-                usedAt:
-                  changedAt,
-              },
-            },
+        if (otp) {
+          await db.collection('otp_verifications').updateOne(
+            { _id: otp._id, usedAt: null },
+            { $set: { usedAt: changedAt } },
           );
+        }
 
         const tokens =
           await issueTokens({

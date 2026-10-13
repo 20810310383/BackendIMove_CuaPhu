@@ -1,6 +1,4 @@
 const express = require('express');
-const crypto = require('crypto');
-const jwt = require('jsonwebtoken');
 const { createAdminGuard } = require('./admin_guard');
 const {
   getAppFeatureSettings,
@@ -15,43 +13,6 @@ function validPhone(phone) {
   return /^0\d{9}$/.test(phone);
 }
 
-function sha256(value) {
-  return crypto.createHash('sha256').update(String(value)).digest('hex');
-}
-
-function generateOtp() {
-  return String(crypto.randomInt(100000, 1000000));
-}
-
-function jwtSecret() {
-  const secret = String(process.env.JWT_ACCESS_SECRET || '').trim();
-  if (secret.length < 32) {
-    throw new Error('JWT_ACCESS_SECRET chưa được cấu hình an toàn.');
-  }
-  return secret;
-}
-
-async function createBypassOtp(db, { phone, purpose }) {
-  const otp = generateOtp();
-  const now = new Date();
-  const minutes = Math.max(5, Number(process.env.AUTH_OTP_MINUTES || 5));
-  const expiresAt = new Date(now.getTime() + minutes * 60 * 1000);
-
-  await db.collection('otp_verifications').insertOne({
-    phone,
-    purpose,
-    codeHash: sha256(otp),
-    createdAt: now,
-    expiresAt,
-    usedAt: null,
-    deliveryStatus: 'BYPASSED',
-    provider: 'ADMIN_FEATURE_TOGGLE',
-    bypassedBecauseOtpDisabled: true,
-  });
-
-  return { otp, expiresAt };
-}
-
 function createFeatureSettingsPublicRouter({ getDb }) {
   const router = express.Router();
 
@@ -64,8 +25,7 @@ function createFeatureSettingsPublicRouter({ getDb }) {
     }
   });
 
-  // Endpoint này chỉ cấp bypass khi Admin đã chủ động TẮT OTP.
-  // Khi OTP đang bật, app phải dùng luồng OTP hiện tại.
+  // API tương thích cho các app cũ: chỉ trả trạng thái OTP, KHÔNG cấp mã bypass.
   router.post('/registration-bootstrap', async (req, res) => {
     try {
       const db = getDb();
@@ -89,39 +49,11 @@ function createFeatureSettingsPublicRouter({ getDb }) {
         });
       }
 
-      if (role === 'CUSTOMER') {
-        const verificationToken = jwt.sign(
-          {
-            phone,
-            purpose: 'CUSTOMER_PHONE_VERIFY',
-            kind: 'OTP_VERIFICATION',
-            bypassedBecauseOtpDisabled: true,
-          },
-          jwtSecret(),
-          {
-            issuer: 'th79-imove',
-            audience: 'th79-imove-apps',
-            expiresIn: 10 * 60,
-          },
-        );
-
-        return res.json({
-          ok: true,
-          otpRequired: false,
-          verificationToken,
-          expiresIn: 600,
-          legalInformationEnabled: settings.legalInformationEnabled,
-        });
-      }
-
-      const purpose = role === 'DRIVER' ? 'DRIVER_REGISTER' : 'MERCHANT_REGISTER';
-      const bypass = await createBypassOtp(db, { phone, purpose });
-
+      // OTP được tắt: Backend nhận đăng ký không kèm OTP.
+      // Không tạo/phát hành mã xác minh giả hay token xác minh công khai.
       return res.json({
         ok: true,
         otpRequired: false,
-        bypassOtp: bypass.otp,
-        expiresAt: bypass.expiresAt.toISOString(),
         legalInformationEnabled: settings.legalInformationEnabled,
       });
     } catch (error) {

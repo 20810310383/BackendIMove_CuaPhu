@@ -38,6 +38,10 @@ const { repairDatabase, completionCollectionForStep, validationDetails } = requi
 const { createCommercePublicRouter, createMerchantRouter, createCommerceDriverRouter, createCommerceAdminRouter, createCommerceDispatchWorker } = require('./commerce_routes');
 const { createAdminConsoleRouter } = require('./admin_console_routes');
 const { createFundTopupRouter, createFundTopupAdminRouter } = require('./fund_topup_routes');
+const { createLegalPublicRouter, createLegalAdminRouter } = require('./legal_routes');
+const { createFeatureSettingsPublicRouter, createFeatureSettingsAdminRouter } = require('./feature_settings_routes');
+const { createOtpAdminRouter } = require('./otp_admin_routes');
+const { createMerchantRegistrationRouter } = require('./merchant_registration_routes');
 const { version: PACKAGE_VERSION } = require('../package.json');
 
 const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCase();
@@ -447,6 +451,14 @@ app.use('/api', async (req, res, next) => {
 app.use('/api/auth', createAuthRouter({ getDb: () => db }));
 app.use('/api/v171/funds', createFundTopupRouter({ getDb:()=>db }));
 app.use('/api/v171/admin/funds', createFundTopupAdminRouter({ getDb:()=>db }));
+// Public settings and legal documents are consumed directly by all three Flutter apps.
+// Admin routes are protected inside their respective routers by requireAdmin + RBAC.
+app.use('/api/v171/legal', createLegalPublicRouter({ getDb: () => db }));
+app.use('/api/v171/admin/legal', createLegalAdminRouter({ getDb: () => db }));
+app.use('/api/v180/app-settings', createFeatureSettingsPublicRouter({ getDb: () => db }));
+app.use('/api/v180/admin/app-settings', createFeatureSettingsAdminRouter({ getDb: () => db }));
+app.use('/api/v171/admin/otp', createOtpAdminRouter({ getDb: () => db }));
+app.use('/api/v171/merchant-registration', createMerchantRegistrationRouter({ getDb: () => db }));
 
 const {
   requireCustomer,

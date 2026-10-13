@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const { sendOtpSms, assertOtpThrottle, normalizePhone } = require('./otp_delivery_service');
+const { getAppFeatureSettings } = require('./app_feature_settings');
 
 function clean(value, max = 240) {
   return String(value ?? '').trim().slice(0, max);
@@ -27,6 +28,9 @@ function createMerchantRegistrationRouter({ getDb }) {
     try {
       const db = getDb();
       const phone = normalizePhone(req.body?.phone);
+      if (!(await getAppFeatureSettings(db)).otpVerificationEnabled) {
+        return res.status(409).json({ code: 'OTP_DISABLED', message: 'OTP đăng ký đã được tắt. Vui lòng đăng ký trực tiếp.' });
+      }
       if (!validVnPhone(phone)) {
         return res.status(400).json({ message: 'Số điện thoại phải gồm 10 số và bắt đầu bằng 0.' });
       }
@@ -106,18 +110,23 @@ function createMerchantRegistrationRouter({ getDb }) {
       if (password.length < 6) return res.status(400).json({ message: 'Mật khẩu phải có ít nhất 6 ký tự.' });
       if (merchantName.length < 2) return res.status(400).json({ message: 'Vui lòng nhập tên cửa hàng/nhà hàng.' });
       if (!['STORE', 'RESTAURANT'].includes(merchantType)) return res.status(400).json({ message: 'Loại đối tác không hợp lệ.' });
-      if (otpCode.length !== 6) return res.status(400).json({ message: 'OTP phải gồm 6 số.' });
+      const requireOtp = (await getAppFeatureSettings(db)).otpVerificationEnabled;
+      if (requireOtp && !/^\d{6}$/.test(otpCode)) return res.status(400).json({ message: 'OTP phải gồm 6 số.' });
 
       const exists = await db.collection('users').findOne({ phone });
       if (exists) return res.status(409).json({ message: 'Số điện thoại này đã có tài khoản.' });
 
-      const otp = await db.collection('otp_verifications').findOne(
-        { phone, purpose, usedAt: null, cancelledAt: { $exists: false } },
-        { sort: { createdAt: -1 } },
-      );
-      if (!otp) return res.status(400).json({ message: 'Không tìm thấy OTP hợp lệ. Vui lòng gửi mã mới.' });
-      if (new Date(otp.expiresAt).getTime() <= Date.now()) return res.status(400).json({ message: 'OTP đã hết hạn. Vui lòng gửi mã mới.' });
-      if (sha256(otpCode) !== String(otp.codeHash || '')) return res.status(400).json({ message: 'Mã OTP không đúng.' });
+      const otp = requireOtp
+        ? await db.collection('otp_verifications').findOne(
+            { phone, purpose, usedAt: null, cancelledAt: { $exists: false }, bypassedBecauseOtpDisabled: { $ne: true } },
+            { sort: { createdAt: -1 } },
+          )
+        : null;
+      if (requireOtp) {
+        if (!otp) return res.status(400).json({ message: 'Không tìm thấy OTP hợp lệ. Vui lòng gửi mã mới.' });
+        if (new Date(otp.expiresAt).getTime() <= Date.now()) return res.status(400).json({ message: 'OTP đã hết hạn. Vui lòng gửi mã mới.' });
+        if (sha256(otpCode) !== String(otp.codeHash || '')) return res.status(400).json({ message: 'Mã OTP không đúng.' });
+      }
 
       const now = new Date();
       const passwordHash = await bcrypt.hash(password, 12);
@@ -166,10 +175,12 @@ function createMerchantRegistrationRouter({ getDb }) {
           updatedAt: now,
         });
 
-        await db.collection('otp_verifications').updateOne(
-          { _id: otp._id, usedAt: null },
-          { $set: { usedAt: now, verifiedAt: now } },
-        );
+        if (otp) {
+          await db.collection('otp_verifications').updateOne(
+            { _id: otp._id, usedAt: null },
+            { $set: { usedAt: now, verifiedAt: now } },
+          );
+        }
 
         await db.collection('audit_logs').insertOne({
           actorType: 'MERCHANT_REGISTER',
