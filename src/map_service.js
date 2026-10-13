@@ -1,5 +1,9 @@
 'use strict';
 
+const DEFAULT_GEOCODING_URL = 'https://nominatim.openstreetmap.org';
+const DEFAULT_ROUTING_URL = 'https://router.project-osrm.org';
+const DEFAULT_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+
 function number(value, label) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) throw new TypeError(`${label} must be a finite number`);
@@ -108,26 +112,18 @@ function createFallbackRoute(fromLat, fromLon, toLat, toLon) {
   };
 }
 
-function configuredUrl(value, name, { trimTrailingSlash = true } = {}) {
-  const configured = String(value || '').trim();
-  if (!configured) throw new Error(`${name} chưa được cấu hình trong .env.`);
-  try {
-    const parsed = new URL(configured);
-    if (!['http:', 'https:'].includes(parsed.protocol)) throw new Error('unsupported protocol');
-  } catch (_) {
-    throw new Error(`${name} phải là URL http(s) hợp lệ.`);
-  }
-  return trimTrailingSlash ? configured.replace(/\/+$/, '') : configured;
+function trimBaseUrl(value, fallback) {
+  return String(value || fallback).trim().replace(/\/+$/, '');
 }
 
 function createMapService(options = {}) {
   const fetchImpl = options.fetchImpl || global.fetch;
   if (typeof fetchImpl !== 'function') throw new Error('Global fetch is not available');
 
-  const geocodingBaseUrl = configuredUrl(options.geocodingBaseUrl || process.env.OSM_GEOCODING_URL, 'OSM_GEOCODING_URL');
-  const routingBaseUrl = configuredUrl(options.routingBaseUrl || process.env.OSM_ROUTING_URL, 'OSM_ROUTING_URL');
-  const tileUrl = configuredUrl(options.tileUrl || process.env.OSM_TILE_URL, 'OSM_TILE_URL', { trimTrailingSlash: false });
-  const userAgent = String(options.userAgent || process.env.OSM_USER_AGENT || 'TH79-iMove').trim();
+  const geocodingBaseUrl = trimBaseUrl(options.geocodingBaseUrl || process.env.OSM_GEOCODING_URL, DEFAULT_GEOCODING_URL);
+  const routingBaseUrl = trimBaseUrl(options.routingBaseUrl || process.env.OSM_ROUTING_URL, DEFAULT_ROUTING_URL);
+  const tileUrl = String(options.tileUrl || process.env.OSM_TILE_URL || DEFAULT_TILE_URL).trim();
+  const userAgent = String(options.userAgent || process.env.OSM_USER_AGENT || 'TH79-iMove/1.6.0 (+https://daututh79.com)').trim();
   const timeoutMs = Math.max(1000, Number(options.timeoutMs || process.env.OSM_HTTP_TIMEOUT_MS || 7000));
   const cacheMs = Math.max(0, Number(options.cacheMs || process.env.OSM_GEOCODE_CACHE_MS || 300000));
   const cache = new Map();

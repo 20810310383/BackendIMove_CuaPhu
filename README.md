@@ -4,6 +4,7 @@ Node.js/Express Core API cho iMove. Development port: `5050`; MongoDB database: 
 
 ```powershell
 npm install
+npm test
 npm run check
 npm run dev
 ```

@@ -1,13 +1,15 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const { ObjectId } = require('mongodb');
-const {
-  bearerToken,
-  ensureAdminSessionIndexes,
-  issueAdminSession,
-  revokeAdminSession,
-  verifyAdminSession,
-} = require('./admin_session');
+
+function jwtSecret() {
+  const secret = String(process.env.JWT_ACCESS_SECRET || '').trim();
+  if (secret.length < 32) {
+    throw new Error('JWT_ACCESS_SECRET chưa được cấu hình an toàn.');
+  }
+  return secret;
+}
 
 function safeObjectId(value) {
   try {
@@ -30,13 +32,6 @@ function publicAdmin(user) {
 
 function createAdminAuthRouter({ getDb }) {
   const router = express.Router();
-  let indexesReadyFor = null;
-
-  async function ensureIndexes(db) {
-    if (indexesReadyFor === db) return;
-    await ensureAdminSessionIndexes(db);
-    indexesReadyFor = db;
-  }
 
   // Basic in-memory brute-force protection for development/local deployment.
   // Production should move rate limiting to Redis/reverse proxy.
@@ -95,15 +90,17 @@ function createAdminAuthRouter({ getDb }) {
         return res.status(401).json({ message: 'Thiếu Access Token.' });
       }
 
-      const db = getDb();
-      if (!db) {
-        return res.status(503).json({ message: 'Database chưa sẵn sàng.' });
-      }
-      const verified = await verifyAdminSession({ db, token: bearerToken(req) });
-      const userId = verified.userId;
+      const token = header.slice(7).trim();
+      const payload = jwt.verify(token, jwtSecret());
+      const userId = safeObjectId(payload.sub || payload.userId);
 
       if (!userId) {
         return res.status(401).json({ message: 'Access Token không hợp lệ.' });
+      }
+
+      const db = getDb();
+      if (!db) {
+        return res.status(503).json({ message: 'Database chưa sẵn sàng.' });
       }
 
       const user = await db.collection('users').findOne({
@@ -121,12 +118,10 @@ function createAdminAuthRouter({ getDb }) {
       }
 
       req.admin = user;
-      req.adminSession = verified;
       next();
-    } catch (error) {
+    } catch (_) {
       return res.status(401).json({
-        code: error.code || 'INVALID_TOKEN',
-        message: error.message || 'Phiên quản trị không hợp lệ hoặc đã hết hạn.',
+        message: 'Phiên quản trị không hợp lệ hoặc đã hết hạn.',
       });
     }
   }
@@ -137,7 +132,6 @@ function createAdminAuthRouter({ getDb }) {
       if (!db) {
         return res.status(503).json({ message: 'Database chưa sẵn sàng.' });
       }
-      await ensureIndexes(db);
 
       const login = String(
         req.body?.login ||
@@ -189,16 +183,23 @@ function createAdminAuthRouter({ getDb }) {
 
       clearFailures(req);
 
-      const session = await issueAdminSession({ db, user, req });
-      await db.collection('users').updateOne(
-        { _id: user._id },
-        { $set: { lastLoginAt: new Date(), updatedAt: new Date() } },
+      const hours = Math.max(
+        1,
+        Math.min(12, Number(process.env.ADMIN_AUTH_SESSION_HOURS || 8))
+      );
+
+      const accessToken = jwt.sign(
+        {
+          sub: String(user._id),
+          typ: 'ADMIN_WEB',
+        },
+        jwtSecret(),
+        { expiresIn: `${hours}h` }
       );
 
       return res.json({
-        accessToken: session.accessToken,
-        expiresInSeconds: session.expiresInSeconds,
-        expiresAt: session.expiresAt.toISOString(),
+        accessToken,
+        expiresInSeconds: hours * 60 * 60,
         user: publicAdmin(user),
       });
     } catch (error) {
@@ -207,24 +208,7 @@ function createAdminAuthRouter({ getDb }) {
   });
 
   router.get('/me', requireAdmin, async (req, res) => {
-    return res.json({
-      user: publicAdmin(req.admin),
-      expiresAt: req.adminSession.session.expiresAt.toISOString(),
-    });
-  });
-
-  router.post('/logout', requireAdmin, async (req, res) => {
-    try {
-      const db = getDb();
-      await revokeAdminSession({
-        db,
-        sessionId: req.adminSession.session._id,
-        reason: 'LOGOUT',
-      });
-      return res.json({ success: true });
-    } catch (error) {
-      return res.status(500).json({ message: error.message });
-    }
+    return res.json({ user: publicAdmin(req.admin) });
   });
 
   return router;

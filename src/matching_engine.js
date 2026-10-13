@@ -55,7 +55,6 @@ function createMatchingEngine({
   getDb,
   serializeBooking,
   addEvent,
-  getDispatch = () => null,
 }) {
   const config = {
     enabled: asBool(process.env.MATCHING_ENABLED, true),
@@ -142,7 +141,7 @@ function createMatchingEngine({
     policyCache = normalized;
     policyCacheAt = Date.now();
     if (normalized.autoDispatchEnabled) {
-      setImmediate(() => resumeAutoDispatch().catch((error) => {
+      setImmediate(() => resumeSearchingBookings().catch((error) => {
         console.error('[Matching] Auto dispatch resume failed:', error.message);
       }));
     }
@@ -1764,16 +1763,6 @@ function createMatchingEngine({
     }
   }
 
-  // V6.9 is the authoritative dispatcher for new bookings.  Keeping this
-  // indirection prevents the Matching policy screen from restarting the
-  // deprecated driver_offers flow while the Live Dispatch screen is using
-  // booking_offers_v69 for the same booking.
-  async function resumeAutoDispatch() {
-    const dispatch = typeof getDispatch === 'function' ? getDispatch() : null;
-    if (dispatch?.resumePendingBookings) return dispatch.resumePendingBookings();
-    return resumeSearchingBookings();
-  }
-
   async function sweepExpiredOffers() {
     const db = getDb();
     if (!db) return;
@@ -1802,7 +1791,7 @@ function createMatchingEngine({
       },
       { upsert: true },
     );
-    await resumeAutoDispatch();
+    await resumeSearchingBookings();
     if (!sweeping) {
       sweeping = setInterval(() => {
         sweepExpiredOffers().catch((error) => {
@@ -2011,7 +2000,6 @@ function createMatchingEngine({
     requeueAfterDriverCancel,
     onBookingTerminal,
     emitBookingUpdate,
-    emitToDriver,
     emitToUser,
     serializeBookingPublic,
     onDriverOffline,

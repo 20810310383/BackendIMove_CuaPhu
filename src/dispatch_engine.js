@@ -54,27 +54,6 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     retryTimers.delete(key);
   }
 
-  // The mobile driver app originally consumes /api/bookings/available and the
-  // `driver:offer` socket event.  V6.9 stores offers in a new collection, so
-  // keep that public payload shape available while clients migrate to the
-  // V6.9 endpoints.
-  function serializeDriverOffer(offer, booking) {
-    const expiresAt = new Date(offer.expiresAt);
-    const payload = serializeBooking(booking);
-    payload.offer = {
-      id: String(offer._id),
-      offerId: String(offer._id),
-      attemptNo: Number(offer.round || 1),
-      round: Number(offer.round || 1),
-      expiresAt: expiresAt.toISOString(),
-      secondsRemaining: Math.max(0, Math.ceil((expiresAt.getTime() - Date.now()) / 1000)),
-      distanceToPickupKm: offer.matchingSnapshot?.distanceKm ?? null,
-      matchingSource: 'V69_DISPATCH',
-      matchingScore: offer.matchingScore ?? null,
-    };
-    return payload;
-  }
-
   function scheduleRetry(bookingId, delaySeconds = 5, options = {}) {
     const key = String(bookingId);
     clearRetryTimer(bookingId);
@@ -102,38 +81,6 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     await db.collection('dispatch_configs').updateOne({ key: DEFAULT_CONFIG.key }, { $setOnInsert: { ...DEFAULT_CONFIG, createdAt: new Date(), updatedAt: new Date() } }, { upsert: true });
   }
 
-  // Retry timers are intentionally kept in memory, but the booking state is
-  // persisted.  Rebuild those timers after a Core restart so SEARCHING jobs
-  // cannot remain stuck forever in WAITING_* states.
-  async function resumePendingBookings() {
-    const db = getDb();
-    if (!db) return { resumed: 0, skipped: 'DB_UNAVAILABLE' };
-    const cfg = await getConfig();
-    if (!cfg.enabled) return { resumed: 0, skipped: 'DISPATCH_DISABLED' };
-
-    const now = new Date();
-    const bookings = await db.collection('bookings').find({
-      status: 'SEARCHING',
-      $or: [
-        { dispatchEngine: { $exists: false } },
-        { 'dispatchEngine.status': { $in: ['WAITING_NEXT_ROUND', 'WAITING_DRIVER', 'NEXT_ROUND', 'REQUEUED', 'ADMIN_REQUEUED'] } },
-      ],
-    }).sort({ createdAt: 1 }).limit(200).toArray();
-
-    let resumed = 0;
-    for (const booking of bookings) {
-      const state = String(booking.dispatchEngine?.status || 'NEW');
-      const nextRetryAt = booking.dispatchEngine?.nextRetryAt ? new Date(booking.dispatchEngine.nextRetryAt) : null;
-      const delaySeconds = nextRetryAt && Number.isFinite(nextRetryAt.getTime())
-        ? Math.max(0, Math.ceil((nextRetryAt.getTime() - now.getTime()) / 1000))
-        : 0;
-      const reset = state === 'WAITING_DRIVER' || state === 'REQUEUED' || state === 'ADMIN_REQUEUED' || state === 'NEW';
-      scheduleRetry(booking._id, delaySeconds, { reset });
-      resumed += 1;
-    }
-    return { resumed };
-  }
-
   async function getConfig() {
     const doc = await getDb().collection('dispatch_configs').findOne({ key: DEFAULT_CONFIG.key });
     return normalizeConfig(doc || DEFAULT_CONFIG);
@@ -141,24 +88,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
 
   async function saveConfig(raw, adminId = null) {
     const cfg = normalizeConfig(raw || {});
-    const changedAt = new Date();
-    const db = getDb();
-    await db.collection('dispatch_configs').updateOne({ key: DEFAULT_CONFIG.key }, { $set: { ...cfg, key: DEFAULT_CONFIG.key, updatedAt: changedAt, updatedBy: adminId } }, { upsert: true });
-    // The two Admin pages expose one on/off switch under different names.
-    // Persist them together so "Auto Matching: ON" can never coexist with a
-    // disabled Live Dispatch engine.
-    await db.collection('matching_policies').updateOne(
-      { key: 'BIKE_MATCHING_POLICY' },
-      {
-        $set: { autoDispatchEnabled: cfg.enabled, updatedAt: changedAt, updatedBy: adminId, dispatchSyncSource: 'V69_DISPATCH_CONFIG' },
-        $setOnInsert: { key: 'BIKE_MATCHING_POLICY', createdAt: changedAt },
-      },
-      { upsert: true },
-    );
-    getMatching()?.invalidateMatchingPolicyCache?.();
-    if (cfg.enabled) setImmediate(() => resumePendingBookings().catch((error) => {
-      console.error('[V6.9 Dispatch] Resume after config change failed:', error.message);
-    }));
+    await getDb().collection('dispatch_configs').updateOne({ key: DEFAULT_CONFIG.key }, { $set: { ...cfg, key: DEFAULT_CONFIG.key, updatedAt: new Date(), updatedBy: adminId } }, { upsert: true });
     return cfg;
   }
 
@@ -258,8 +188,6 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       if (!offer) continue;
       const payload = serializeBooking(booking);
       getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: payload, round: nextRound, matchingScore: c.score });
-      // Backward-compatible real-time event for the currently deployed Driver app.
-      getMatching().emitToDriver(driverId, 'driver:offer', serializeDriverOffer(offer, booking));
       await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.socketSent': true, updatedAt: new Date() } });
       await notificationService.enqueue({ dedupeKey: `BOOKING_OFFER:${bookingId}:${driverId}:${dispatchVersion}`, type: 'BOOKING_OFFER', targetType: 'DRIVER', targetId: driverId, bookingId, offerId: offer._id, title: 'Có chuyến mới', body: c.distanceKm == null ? 'Có khách đang chờ bạn nhận chuyến.' : `Điểm đón cách bạn ${Number(c.distanceKm).toFixed(1)} km`, data: { bookingId, offerId: offer._id, dispatchVersion, expiresAt } });
       await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.fcmQueued': true } });
@@ -328,11 +256,6 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     const booking = await db.collection('bookings').findOne({ _id: offer.bookingId });
     if (!booking || !['SEARCHING', 'OFFERED'].includes(booking.status)) return null;
     return { offer, booking };
-  }
-
-  async function getAvailableOffers(driverId) {
-    const active = await activeOfferForDriver(driverId);
-    return active ? [serializeDriverOffer(active.offer, active.booking)] : [];
   }
 
   async function addCooldown(driverId, bookingId, type, seconds, reason) {
@@ -444,28 +367,6 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       setImmediate(() => dispatchWithRetry(booking._id, { reset: true }, attempt).catch(e => console.error('[V6.9 Dispatch retry]', e.message)));
     }
 
-    // Covers timers that were lost on restart and normal jobs whose scheduled
-    // callback was interrupted.  Claim the row before dispatching so the
-    // one-second sweep cannot start the same round twice.
-    const dueJobs = await db.collection('bookings').find({
-      status: 'SEARCHING',
-      'dispatchEngine.status': { $in: ['WAITING_NEXT_ROUND', 'WAITING_DRIVER', 'NEXT_ROUND'] },
-      $or: [
-        { 'dispatchEngine.nextRetryAt': { $lte: now } },
-        { 'dispatchEngine.nextRetryAt': { $exists: false } },
-      ],
-    }).limit(50).toArray();
-    for (const booking of dueJobs) {
-      const previousState = String(booking.dispatchEngine?.status || 'NEXT_ROUND');
-      const claimed = await db.collection('bookings').updateOne(
-        { _id: booking._id, status: 'SEARCHING', 'dispatchEngine.status': previousState },
-        { $set: { 'dispatchEngine.status': 'RESUMING', updatedAt: now } },
-      );
-      if (!claimed.modifiedCount) continue;
-      const reset = previousState === 'WAITING_DRIVER';
-      setImmediate(() => dispatchWithRetry(booking._id, { reset }).catch(e => console.error('[V6.9 Dispatch resume]', e.message)));
-    }
-
     const expired = await db.collection('booking_offers_v69').find({ status: 'PENDING', expiresAt: { $lte: now } }).limit(100).toArray();
     const cfg = await getConfig();
     for (const offer of expired) {
@@ -514,7 +415,6 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       offer = { ...offer, status: 'PENDING', offeredAt: now, expiresAt, respondedAt: null, reason: null, manualAttempt };
     }
     getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: serializeBooking(booking), manual: true });
-    getMatching().emitToDriver(driverId, 'driver:offer', serializeDriverOffer(offer, booking));
     await notificationService.enqueue({ dedupeKey: `BOOKING_OFFER_MANUAL:${bookingId}:${driverId}:${version}:${offer.manualAttempt || 1}`, type: 'BOOKING_OFFER', targetType: 'DRIVER', targetId: driverId, bookingId, offerId: offer._id, title: 'Có chuyến được điều phối', body: 'Điều hành iMove vừa phát một chuyến cho bạn.', data: { bookingId, offerId: offer._id, dispatchVersion: version, expiresAt } });
     await getDb().collection('bookings').updateOne(
       { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
@@ -537,7 +437,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
   async function start() { if (started) return; started = true; sweepTimer = setInterval(() => sweepExpiredOffers().catch(e => console.error('[V6.9 Dispatch sweep]', e.message)), 1000); sweepTimer.unref?.(); }
   function close() { if (sweepTimer) clearInterval(sweepTimer); sweepTimer = null; for (const timer of retryTimers.values()) clearTimeout(timer); retryTimers.clear(); }
 
-  return { databaseReady, resumePendingBookings, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, activeOfferForDriver, getAvailableOffers, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, start, close, addCooldown };
+  return { databaseReady, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, activeOfferForDriver, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, start, close, addCooldown };
 }
 
 module.exports = { createDispatchEngine, DEFAULT_CONFIG, normalizeConfig };

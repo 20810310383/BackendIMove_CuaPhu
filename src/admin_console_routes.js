@@ -1,11 +1,7 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const { ObjectId, Int32 } = require('mongodb');
-const {
-  bearerToken,
-  revokeAdminSessionsForUser,
-  verifyAdminSession,
-} = require('./admin_session');
 
 const ADMIN_ALL_PERMISSIONS = [
   'dashboard.view',
@@ -37,12 +33,11 @@ const DEFAULT_ADMIN_ROLES = [
   ['VIEWER','Chỉ xem',['dashboard.view','users.view','drivers.view','bookings.view','pricing.view','fees.view','payments.view','reports.view','broadcast.view']]
 ];
 
-function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6.1', backendUrl = '' } = {}) {
+function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6.1', backendUrl = 'https://backendimove.daututh79.com' } = {}) {
   if (typeof getDb !== 'function') throw new Error('createAdminConsoleRouter yêu cầu getDb().');
   const router = express.Router();
   const APP_VERSION = String(appVersion || '1.6.1');
-  const CORE_BACKEND_URL = String(backendUrl || '').trim().replace(/\/+$/, '');
-  if (!CORE_BACKEND_URL) throw new Error('CORE_PUBLIC_URL chưa được cấu hình.');
+  const CORE_BACKEND_URL = String(backendUrl || 'https://backendimove.daututh79.com').replace(/\/+$/, '');
   const DB_NAME = String(process.env.MONGODB_DB || 'th79_imove');
 
   const collectionMap = {
@@ -77,42 +72,10 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     return out;
   }
 
-  function publicDriverUser(user) {
-    if (!user) return null;
-    return {
-      id: String(user._id),
-      fullName: user.fullName || user.name || null,
-      name: user.name || user.fullName || null,
-      phone: user.phone || null,
-      email: user.email || null,
-      avatarUrl: user.avatarUrl || user.avatar?.url || null,
-    };
-  }
-
   async function getArrayData(key) {
     const collection = db().collection(collectionMap[key]);
     const filter = key === 'customers' && collectionMap.customers === 'users' ? { roles: 'CUSTOMER' } : {};
     const rows = await collection.find(filter).sort({ createdAt: -1, _id: -1 }).toArray();
-
-    // Driver records only keep userId.  Enriching each row here keeps the
-    // legacy Driver screen in sync with the canonical users collection.
-    if (key === 'drivers') {
-      const rawUserIds = [...new Set(rows.map((row) => String(row.userId || '')).filter(Boolean))];
-      const userLookupIds = rawUserIds.flatMap((id) => {
-        const objectId = objectIdOrNull(id);
-        return objectId ? [id, objectId] : [id];
-      });
-      const users = userLookupIds.length
-        ? await db().collection('users').find({ _id: { $in: userLookupIds } }).project({ fullName: 1, name: 1, phone: 1, email: 1, avatar: 1, avatarUrl: 1 }).toArray()
-        : [];
-      const userById = new Map(users.map((user) => [String(user._id), user]));
-
-      return rows.map((driver) => ({
-        ...serializeDoc(driver),
-        user: publicDriverUser(userById.get(String(driver.userId || ''))),
-      }));
-    }
-
     return rows.map(serializeDoc);
   }
 
@@ -187,30 +150,6 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     await audit.createIndex({actorType:1,createdAt:-1},{name:'idx_audit_actor_type_created'}).catch(()=>{});
     await audit.createIndex({actorId:1,createdAt:-1},{name:'idx_audit_actor_created'}).catch(()=>{});
     await audit.createIndex({action:1,createdAt:-1},{name:'idx_audit_action_created'}).catch(()=>{});
-    // List screens always sort newest-first and load only one page.  These
-    // indexes keep page changes fast even when the Atlas collections grow.
-    await Promise.all([
-      db().collection('bookings').createIndex({createdAt:-1},{name:'idx_bookings_created'}),
-      db().collection('bookings').createIndex({status:1,createdAt:-1},{name:'idx_bookings_status_created'}),
-      db().collection('bookings').createIndex({customerId:1,createdAt:-1},{name:'idx_bookings_customer_created'}),
-      db().collection('bookings').createIndex({customerPhone:1,createdAt:-1},{name:'idx_bookings_customer_phone_created'}),
-      db().collection('bookings').createIndex({'customerSnapshot.phone':1,createdAt:-1},{name:'idx_bookings_customer_snapshot_phone_created'}),
-      db().collection('users').createIndex({roles:1,createdAt:-1},{name:'idx_users_roles_created'}),
-      db().collection('drivers').createIndex({kycStatus:1,updatedAt:-1},{name:'idx_drivers_kyc_updated'}),
-      db().collection('drivers').createIndex({updatedAt:-1},{name:'idx_drivers_updated'}),
-      db().collection('merchants').createIndex({createdAt:-1},{name:'idx_merchants_created'}),
-      db().collection('orders').createIndex({createdAt:-1},{name:'idx_orders_created'}),
-      db().collection('orders').createIndex({status:1,serviceCode:1,createdAt:-1},{name:'idx_orders_status_service_created'}),
-      db().collection('orders').createIndex({status:1,createdAt:-1},{name:'idx_orders_status_created'}),
-      db().collection('orders').createIndex({serviceCode:1,createdAt:-1},{name:'idx_orders_service_created'}),
-      db().collection('payments').createIndex({createdAt:-1},{name:'idx_payments_created'}),
-      db().collection('admin_broadcasts').createIndex({createdAt:-1},{name:'idx_admin_broadcasts_created'}),
-      db().collection('notification_outbox').createIndex({broadcastId:1,status:1},{name:'idx_outbox_broadcast_status'}),
-      db().collection('notifications').createIndex({broadcastId:1},{name:'idx_notifications_broadcast'}),
-      db().collection('promotions').createIndex({createdAt:-1},{name:'idx_promotions_created'}),
-      db().collection('driver_point_topups').createIndex({status:1,createdAt:-1},{name:'idx_point_topups_status_created'}),
-      db().collection('conversations').createIndex({type:1,status:1,updatedAt:-1},{name:'idx_support_conversations_updated'}),
-    ].map((job)=>job.catch(()=>{})));
     for(const [code,name,permissions] of DEFAULT_ADMIN_ROLES){
       const setOnInsert={code,name,permissions,status:'ACTIVE',createdAt:new Date()};
       const update=code==='SUPER_ADMIN'
@@ -251,11 +190,22 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
   }
 
   const adminTokenCache=new Map();
+  function jwtSecret(){
+    const secret=String(process.env.JWT_ACCESS_SECRET||'').trim();
+    if(secret.length<32){const e=new Error('JWT_ACCESS_SECRET chưa được cấu hình an toàn.');e.status=500;throw e}
+    return secret;
+  }
   async function resolveAdminAccess(req){
     const header=String(req.headers.authorization||'');
     if(!header.startsWith('Bearer ')){const e=new Error('Thiếu Access Token quản trị.');e.status=401;throw e}
-    const verified=await verifyAdminSession({db:db(),token:bearerToken(req)});
-    const userId=verified.userId;
+    const token=header.slice(7).trim();
+    const cached=adminTokenCache.get(token);
+    if(cached&&Date.now()-cached.at<30000)return cached.access;
+
+    let payload;
+    try{payload=jwt.verify(token,jwtSecret())}
+    catch(_){const e=new Error('Phiên quản trị không hợp lệ hoặc đã hết hạn.');e.status=401;throw e}
+    const userId=objectIdOrNull(payload?.sub||payload?.userId);
     if(!userId){const e=new Error('Access Token quản trị không hợp lệ.');e.status=401;throw e}
     const user=await db().collection('users').findOne({_id:userId,roles:'ADMIN'});
     if(!user){const e=new Error('Không tìm thấy tài khoản ADMIN trong MongoDB.');e.status=403;throw e}
@@ -269,6 +219,8 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
       : [...new Set(roles.flatMap(r=>Array.isArray(r.permissions)?r.permissions:[]))];
     const roleNames=roleCodes.map(code=>roles.find(r=>r.code===code)?.name||code);
     const access={user:publicInternalAdmin(user),roleCodes,roleNames,permissions};
+    adminTokenCache.set(token,{at:Date.now(),access});
+    if(adminTokenCache.size>150){for(const [key,value] of adminTokenCache){if(Date.now()-value.at>60000)adminTokenCache.delete(key)}}
     return access;
   }
 
@@ -335,8 +287,7 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
   // Read-only audit history for internal admin accounts.
   router.get('/api/admin-audit',requireAdminAccess('audit.view'),async(req,res)=>{
     try{
-      const limit=Math.min(100,Math.max(1,Number(req.query.limit||20)));
-      const page=Math.max(1,Math.round(Number(req.query.page||1)));
+      const limit=Math.min(500,Math.max(1,Number(req.query.limit||250)));
       const filter={actorType:'ADMIN'};
       const action=String(req.query.action||'').trim();
       const actorId=objectIdOrNull(req.query.actorId);
@@ -350,22 +301,25 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
         if(to){const d=new Date(`${to}T23:59:59.999`);if(!Number.isNaN(d.getTime()))filter.createdAt.$lte=d}
         if(!Object.keys(filter.createdAt).length)delete filter.createdAt;
       }
-      const q=String(req.query.q||'').trim();
-      if(q){const regex={$regex:q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),$options:'i'};filter.$or=[{action:regex},{entityType:regex},{entityId:regex},{ip:regex},{actorName:regex},{actorPhone:regex},{actorEmail:regex}];}
 
-      const [logs,total]=await Promise.all([db().collection('audit_logs').find(filter).sort({createdAt:-1}).skip((page-1)*limit).limit(limit).toArray(),db().collection('audit_logs').countDocuments(filter)]);
+      let logs=await db().collection('audit_logs').find(filter).sort({createdAt:-1}).limit(limit).toArray();
       const actorIds=[...new Set(logs.map(x=>x.actorId).filter(Boolean).map(String))].map(objectIdOrNull).filter(Boolean);
       const actors=actorIds.length?await db().collection('users').find({_id:{$in:actorIds},roles:'ADMIN'}).project({fullName:1,phone:1,email:1,status:1}).toArray():[];
       const actorMap=new Map(actors.map(a=>[String(a._id),a]));
+      const q=String(req.query.q||'').trim().toLowerCase();
       const rows=logs.map(log=>{
         const actor=actorMap.get(String(log.actorId||''));
         return {
           ...serializeDoc(log),
           actor:actor?{id:String(actor._id),fullName:actor.fullName||log.actorName||'Quản trị viên',phone:actor.phone||log.actorPhone||null,email:actor.email||log.actorEmail||null,status:actor.status||'ACTIVE'}:{id:log.actorId?String(log.actorId):null,fullName:log.actorName||'Tài khoản cũ/không xác định',phone:log.actorPhone||null,email:log.actorEmail||null,status:null}
         };
+      }).filter(row=>{
+        if(!q)return true;
+        const text=[row.action,row.entityType,row.entityId,row.ip,row.actor?.fullName,row.actor?.phone,row.actor?.email,JSON.stringify(row.before||{}),JSON.stringify(row.after||{})].join(' ').toLowerCase();
+        return text.includes(q);
       });
       const actorList=await db().collection('users').find({roles:'ADMIN'}).project({fullName:1,phone:1,email:1,status:1}).sort({fullName:1}).toArray();
-      res.json({logs:rows,pagination:{page,limit,total,totalPages:Math.max(1,Math.ceil(total/limit))},actors:actorList.map(a=>({id:String(a._id),fullName:a.fullName||'Quản trị viên',phone:a.phone||null,email:a.email||null,status:a.status||'ACTIVE'}))});
+      res.json({logs:rows,actors:actorList.map(a=>({id:String(a._id),fullName:a.fullName||'Quản trị viên',phone:a.phone||null,email:a.email||null,status:a.status||'ACTIVE'}))});
     }catch(error){res.status(500).json({message:error.message})}
   });
 
@@ -453,21 +407,17 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
 
   router.get('/api/admin-support/conversations', requireAdminAccess('support.view'), async (req, res) => {
     try {
-      const limit = Math.min(100, Math.max(1, Number(req.query.limit || 20)));
-      const page = Math.max(1, Math.round(Number(req.query.page || 1)));
+      const limit = Math.min(150, Math.max(1, Number(req.query.limit || 100)));
       const status = String(req.query.status || 'ALL').trim().toUpperCase();
-      const query = String(req.query.q || '').trim();
+      const query = String(req.query.q || '').trim().toLowerCase();
       const filter = supportConversationFilter();
       if (status !== 'ALL') filter.status = status;
-      if (query) {
-        const regex = { $regex: query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-        filter.$or = [{ title: regex }, { lastMessage: regex }];
-      }
-      const [docs, total] = await Promise.all([
-        db().collection('conversations').find(filter).sort({ updatedAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).toArray(),
-        db().collection('conversations').countDocuments(filter),
-      ]);
-      if (!docs.length) return res.json({ items: [], pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } });
+      const docs = await db().collection('conversations')
+        .find(filter)
+        .sort({ updatedAt: -1, _id: -1 })
+        .limit(limit)
+        .toArray();
+      if (!docs.length) return res.json([]);
 
       const ids = docs.map((x) => x._id);
       const ownerIds = [...new Set(docs.map((x) => String(x.ownerUserId || '')).filter(Boolean))]
@@ -504,7 +454,10 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
           createdAt: doc.createdAt || null, updatedAt: doc.updatedAt || null,
         };
       });
-      res.json({ items: rows, pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) } });
+      const filtered = query
+        ? rows.filter((row) => [row.title, row.lastMessage, row.owner?.fullName, row.owner?.phone, row.owner?.email, ...(row.owner?.roles || [])].join(' ').toLowerCase().includes(query))
+        : rows;
+      res.json(filtered);
     } catch (error) {
       res.status(500).json({ message: error.message });
     }
@@ -679,7 +632,10 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
       const now=new Date();
       await users.updateOne({_id:id,roles:'ADMIN'},{$set:{passwordHash,mustChangePassword:false,failedLoginCount:0,updatedAt:now}});
       adminTokenCache.clear();
-      await revokeAdminSessionsForUser({db:db(),userId:id,reason:'SELF_PASSWORD_CHANGE'}).catch(()=>{});
+      await db().collection('auth_sessions').updateMany(
+        {userId:id,revokedAt:{$exists:false}},
+        {$set:{revokedAt:now,revokeReason:'SELF_PASSWORD_CHANGE',updatedAt:now}}
+      ).catch(()=>{});
       await auditAdmin(req,'ADMIN_SELF_PASSWORD_CHANGE','ADMIN_USER',id,null,{passwordChangedAt:now});
       res.json({success:true});
     }catch(error){res.status(400).json({message:error.message})}
@@ -687,15 +643,11 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
 
   router.get('/api/admin-management/bootstrap',requireAnyAdminAccess(['admins.view','admins.manage','roles.manage']),async(req,res)=>{
     try{
-      const page=Math.max(1,Math.round(Number(req.query.page)||1)),limit=Math.max(1,Math.min(100,Math.round(Number(req.query.limit)||20)));
-      const q=String(req.query.q||'').trim();const accountFilter={roles:'ADMIN'};
-      if(q){const regex={$regex:q.replace(/[.*+?^${}()|[\]\\]/g,'\\$&'),$options:'i'};accountFilter.$or=[{fullName:regex},{phone:regex},{email:regex}];}
-      const [accounts,roles,total]=await Promise.all([
-        req.adminAccess.permissions.includes('admins.view')?db().collection('users').find(accountFilter).sort({createdAt:1,_id:1}).skip((page-1)*limit).limit(limit).toArray():[],
+      const [accounts,roles]=await Promise.all([
+        req.adminAccess.permissions.includes('admins.view')?db().collection('users').find({roles:'ADMIN'}).sort({createdAt:1,_id:1}).toArray():[],
         db().collection('admin_roles').find({}).sort({code:1}).toArray()
-        ,req.adminAccess.permissions.includes('admins.view')?db().collection('users').countDocuments(accountFilter):Promise.resolve(0)
       ]);
-      res.json({accounts:accounts.map(publicInternalAdmin),roles:roles.map(r=>({...r,_id:String(r._id)})),pagination:{page,limit,total,totalPages:Math.max(1,Math.ceil(total/limit))},permissions:ADMIN_ALL_PERMISSIONS});
+      res.json({accounts:accounts.map(publicInternalAdmin),roles:roles.map(r=>({...r,_id:String(r._id)})),permissions:ADMIN_ALL_PERMISSIONS});
     }catch(error){res.status(500).json({message:error.message})}
   });
 
@@ -728,7 +680,6 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
       if('roleCodes'in req.body){const codes=await validRoleCodes(req.body.roleCodes);if(String(req.adminAccess.user.id)===String(id)&&!codes.includes('SUPER_ADMIN')&&adminRoleCodesOf(existing).includes('SUPER_ADMIN'))return res.status(409).json({message:'Bạn không thể tự gỡ quyền SUPER_ADMIN của chính mình.'});update.adminRoleCodes=codes;update.roleCodes=codes}
       if('status'in req.body){const v=String(req.body.status||'').toUpperCase()==='BLOCKED'?'BLOCKED':'ACTIVE';if(String(req.adminAccess.user.id)===String(id)&&v!=='ACTIVE')return res.status(409).json({message:'Bạn không thể tự khóa tài khoản đang đăng nhập.'});update.status=v}
       const result=await users.findOneAndUpdate({_id:id,roles:'ADMIN'},{$set:update},{returnDocument:'after'});adminTokenCache.clear();
-      await revokeAdminSessionsForUser({db:db(),userId:id,reason:'ADMIN_ACCOUNT_UPDATED'}).catch(()=>{});
       await auditAdmin(req,'ADMIN_ACCOUNT_UPDATE','ADMIN_USER',id,publicInternalAdmin(existing),publicInternalAdmin(result));
       res.json(publicInternalAdmin(result));
     }catch(error){res.status(400).json({message:error.message})}
@@ -738,7 +689,7 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     try{
       const id=objectIdOrNull(req.params.id);if(!id)return res.status(400).json({message:'ID tài khoản không hợp lệ.'});const password=String(req.body?.password||'');if(password.length<8)return res.status(400).json({message:'Mật khẩu phải có ít nhất 8 ký tự.'});
       const passwordHash=await bcrypt.hash(password,12),now=new Date();const result=await db().collection('users').updateOne({_id:id,roles:'ADMIN'},{$set:{passwordHash,mustChangePassword:false,failedLoginCount:0,updatedAt:now}});if(!result.matchedCount)return res.status(404).json({message:'Không tìm thấy tài khoản ADMIN.'});
-      await revokeAdminSessionsForUser({db:db(),userId:id,reason:'ADMIN_PASSWORD_RESET'}).catch(()=>{});
+      if(db().collection('auth_sessions'))await db().collection('auth_sessions').updateMany({userId:id,revokedAt:{$exists:false}},{$set:{revokedAt:now,revokeReason:'ADMIN_PASSWORD_RESET',updatedAt:now}}).catch(()=>{});
       adminTokenCache.clear();await auditAdmin(req,'ADMIN_PASSWORD_RESET','ADMIN_USER',id,null,{passwordResetAt:now});res.json({success:true});
     }catch(error){res.status(400).json({message:error.message})}
   });
@@ -748,7 +699,7 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
       const id=objectIdOrNull(req.params.id);if(!id)return res.status(400).json({message:'ID tài khoản không hợp lệ.'});if(String(req.adminAccess.user.id)===String(id))return res.status(409).json({message:'Bạn không thể xóa tài khoản đang đăng nhập.'});
       const users=db().collection('users'),existing=await users.findOne({_id:id,roles:'ADMIN'});if(!existing)return res.status(404).json({message:'Không tìm thấy tài khoản ADMIN.'});
       if(adminRoleCodesOf(existing).includes('SUPER_ADMIN')){const admins=await users.find({roles:'ADMIN',status:'ACTIVE'}).toArray();const superCount=admins.filter(a=>adminRoleCodesOf(a).includes('SUPER_ADMIN')).length;if(superCount<=1)return res.status(409).json({message:'Không thể xóa SUPER_ADMIN cuối cùng của hệ thống.'})}
-      await users.deleteOne({_id:id,roles:'ADMIN'});await revokeAdminSessionsForUser({db:db(),userId:id,reason:'ADMIN_ACCOUNT_DELETED'}).catch(()=>{});adminTokenCache.clear();
+      await users.deleteOne({_id:id,roles:'ADMIN'});await db().collection('auth_sessions').updateMany({userId:id,revokedAt:{$exists:false}},{$set:{revokedAt:new Date(),revokeReason:'ADMIN_ACCOUNT_DELETED',updatedAt:new Date()}}).catch(()=>{});adminTokenCache.clear();
       await auditAdmin(req,'ADMIN_ACCOUNT_DELETE','ADMIN_USER',id,publicInternalAdmin(existing),null);res.json({success:true});
     }catch(error){res.status(400).json({message:error.message})}
   });
@@ -809,33 +760,6 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
   router.get('/api/data/settings', requireAdminAccess('settings.view'), async (_req, res) => {
     try { res.json(await getSettings()); }
     catch (error) { res.status(500).json({ message: error.message }); }
-  });
-
-  router.get('/api/customers', requireAdminAccess('users.view'), async (req, res) => {
-    try {
-      const page = Math.max(1, Math.round(Number(req.query.page || 1)));
-      const limit = Math.max(1, Math.min(100, Math.round(Number(req.query.limit || 20))));
-      const keyword = String(req.query.q || '').trim();
-      const filter = { roles: 'CUSTOMER' };
-      if (keyword) {
-        const regex = { $regex: keyword.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
-        filter.$or = [{ fullName: regex }, { name: regex }, { phone: regex }, { email: regex }];
-      }
-      const [customers, total] = await Promise.all([
-        db().collection('users').find(filter).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).toArray(),
-        db().collection('users').countDocuments(filter),
-      ]);
-      const customerIds = customers.map((customer) => customer._id);
-      const phones = customers.map((customer) => customer.phone).filter(Boolean);
-      const trips = customerIds.length ? await db().collection(collectionMap.trips).find({
-        $or: [{ customerId: { $in: customerIds } }, { customerPhone: { $in: phones } }, { 'customerSnapshot.phone': { $in: phones } }],
-      }).sort({ createdAt: -1 }).limit(100).toArray() : [];
-      res.json({
-        customers: customers.map(serializeDoc),
-        trips: trips.map(serializeDoc),
-        pagination: { page, limit, total, totalPages: Math.max(1, Math.ceil(total / limit)) },
-      });
-    } catch (error) { res.status(500).json({ message: error.message }); }
   });
 
   router.put('/api/data/settings', requireAdminAccess('settings.manage'), async (req, res) => {

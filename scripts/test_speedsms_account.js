@@ -4,11 +4,8 @@ async function main() {
   const token = String(process.env.SPEEDSMS_ACCESS_TOKEN || '').trim();
   if (!token) throw new Error('Thiếu SPEEDSMS_ACCESS_TOKEN trong .env');
 
-  const accountInfoUrl = String(process.env.SPEEDSMS_ACCOUNT_INFO_URL || '').trim();
-  if (!accountInfoUrl) throw new Error('Thiếu SPEEDSMS_ACCOUNT_INFO_URL trong .env');
-
   const basic = Buffer.from(`${token}:x`, 'utf8').toString('base64');
-  const response = await fetch(accountInfoUrl, {
+  const response = await fetch('https://api.speedsms.vn/index.php/user/info', {
     headers: { Authorization: `Basic ${basic}` },
   });
   const text = await response.text();

@@ -6,7 +6,6 @@ require('dotenv').config();
 const { calculateFare } = require('./fare_engine');
 const { createKycRouter } = require('./kyc_routes');
 const { createAdminAuthRouter } = require('./admin_auth_routes');
-const { createAdminSessionMiddleware, ensureAdminSessionIndexes } = require('./admin_session');
 const { createAdminOpsRouter } = require('./admin_ops_routes');
 const { createMatchingAdminRouter } = require('./matching_admin_routes');
 const { getLanAddresses, startLanDiscovery, startServiceRegistry } = require('./lan_discovery');
@@ -45,10 +44,9 @@ const NODE_ENV = String(process.env.NODE_ENV || 'development').trim().toLowerCas
 const PRODUCTION = NODE_ENV === 'production';
 const APP_VERSION = String(process.env.APP_VERSION || PACKAGE_VERSION || '1.6.0').trim();
 const PORT = Number(process.env.PORT || 5050);
-const HOST = String(process.env.HOST || '').trim();
+const HOST = String(process.env.HOST || (PRODUCTION ? '127.0.0.1' : '0.0.0.0')).trim();
 const MONGODB_URI = String(process.env.MONGODB_URI || '').trim();
 const DB_NAME = String(process.env.MONGODB_DB || 'th79_imove').trim();
-const CORE_PUBLIC_URL = String(process.env.CORE_PUBLIC_URL || '').trim().replace(/\/+$/, '');
 const RETRY_MS = Math.max(3000, Number(process.env.MONGO_RETRY_SECONDS || 5) * 1000);
 const DEFAULT_BOOKING_TIMEOUT_SECONDS = Math.max(60, Number(process.env.BOOKING_SEARCH_TIMEOUT_SECONDS || 300));
 const DEMO_RUNTIME_ENABLED = !PRODUCTION &&
@@ -64,12 +62,6 @@ const SERVICE_REGISTRY_ENABLED = String(
 ).toLowerCase() === 'true';
 
 assertProductionConfig();
-if (!CORE_PUBLIC_URL) {
-  throw new Error('CORE_PUBLIC_URL chưa được cấu hình trong .env.');
-}
-if (!HOST) {
-  throw new Error('HOST chưa được cấu hình trong .env.');
-}
 
 const app = express();
 app.set('trust proxy', 1);
@@ -441,11 +433,6 @@ app.use('/api', (_req, res, next) => {
   });
 });
 
-// All Admin Web tokens must have an active session record in MongoDB. This
-// applies consistently to every /api admin route, including routes with their
-// own legacy JWT middleware.
-app.use('/api', createAdminSessionMiddleware({ getDb: () => db }));
-
 app.use('/api', async (req, res, next) => {
   try {
     const path = String(req.path || '');
@@ -701,10 +688,10 @@ app.use('/api/v14/admin/promotions', createPromotionAdminRouter({ getDb:()=>db, 
 app.use('/api/v14/admin/analytics', createAnalyticsAdminRouter({ getDb:()=>db, getAnalytics:()=>analyticsService }));
 
 // V1.6 Multi-service Commerce + Merchant
-app.use('/api/v16/commerce', createCommercePublicRouter({ getDb:()=>db, requireCustomer, getPricing:()=>pricingService, getNotifications:()=>notificationService, getMatching:()=>matching }));
-app.use('/api/v16/merchant', createMerchantRouter({ getDb:()=>db, getNotifications:()=>notificationService, getMatching:()=>matching }));
+app.use('/api/v16/commerce', createCommercePublicRouter({ getDb:()=>db, requireCustomer, getPricing:()=>pricingService, getNotifications:()=>notificationService }));
+app.use('/api/v16/merchant', createMerchantRouter({ getDb:()=>db, getNotifications:()=>notificationService }));
 app.use('/api/v16/driver', createCommerceDriverRouter({ getDb:()=>db, requireApprovedDriver, findDriverByPhone, getNotifications:()=>notificationService }));
-app.use('/api/v16/admin/commerce', createCommerceAdminRouter({ getDb:()=>db, getNotifications:()=>notificationService, getMatching:()=>matching }));
+app.use('/api/v16/admin/commerce', createCommerceAdminRouter({ getDb:()=>db, getNotifications:()=>notificationService }));
 
 // V7.2 Driver Experience API
 app.use('/api/v72/driver', requireApprovedDriver, createDriverExperienceRouter({ getDb:()=>db, findDriverByPhone }));
@@ -968,12 +955,6 @@ app.get('/api/bookings/available', requireApprovedDriver, async (req, res) => {
       return res.status(403).json({ message: 'Tài xế đang OFFLINE.' });
     }
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
-    // V6.9 is the dispatcher of record. Keep the established driver polling
-    // endpoint working so a newly placed booking is not invisible to the app.
-    const v69Offers = dispatchEngine
-      ? await dispatchEngine.getAvailableOffers(found.driver._id)
-      : [];
-    if (v69Offers.length) return res.json(v69Offers);
     return res.json(await matching.getAvailableOffers(found.driver._id));
   } catch (error) {
     return res.status(500).json({ message: error.message });
@@ -989,18 +970,6 @@ app.post('/api/bookings/:id/decline', requireApprovedDriver, async (req, res) =>
     if (!found && DEMO_RUNTIME_ENABLED && driverPhone === '0909000001') found = await ensureDemoDriver();
     if (!found) return res.status(404).json({ message: 'Không tìm thấy tài xế.' });
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
-
-    const v69Offer = dispatchEngine
-      ? await dispatchEngine.activeOfferForDriver(found.driver._id)
-      : null;
-    if (v69Offer && String(v69Offer.offer.bookingId) === String(id)) {
-      await dispatchEngine.declineOffer({
-        offerId: v69Offer.offer._id,
-        driverId: found.driver._id,
-        reason: String(req.body?.reason || 'DRIVER_NOT_INTERESTED'),
-      });
-      return res.json({ ok: true, message: 'Đã từ chối chuyến. Hệ thống sẽ chuyển cho tài xế khác.' });
-    }
 
     const booking = await db.collection('bookings').findOne({ _id: id, status: 'SEARCHING' });
     if (!booking) return res.status(409).json({ message: 'Chuyến không còn khả dụng.' });
@@ -1039,20 +1008,6 @@ app.post('/api/bookings/:id/accept', requireApprovedDriver, async (req, res) => 
       return res.status(403).json({ message: 'Tài xế chưa được duyệt đầy đủ KYC.' });
     }
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
-
-    const v69Offer = dispatchEngine
-      ? await dispatchEngine.activeOfferForDriver(found.driver._id)
-      : null;
-    if (v69Offer && String(v69Offer.offer.bookingId) === String(id)) {
-      const doc = await dispatchEngine.acceptOffer({
-        offerId: v69Offer.offer._id,
-        driverId: found.driver._id,
-        userId: req.auth.user._id,
-        idempotencyKey: req.headers['idempotency-key'],
-      });
-      await addEvent(id, 'DRIVER_ACCEPTED', 'DRIVER', found.driver._id, { status: 'DRIVER_ASSIGNED', source: 'LEGACY_DRIVER_API' });
-      return res.json(doc);
-    }
 
     const validation = await matching.validateActiveOffer(id, found.driver._id);
     if (!validation.ok) return res.status(409).json({ message: validation.message });
@@ -1390,13 +1345,14 @@ app.get('/api/customers/:phone/bookings', requireCustomer, async (req, res) => {
 });
 
 
-// Admin Console API is merged directly into the Core Backend. Its public URL
-// comes from CORE_PUBLIC_URL so deployments do not require source changes.
+// Admin Console API is merged directly into the Core Backend.
+// This removes the separate Admin Gateway :5060 and lets the Vercel Admin call
+// https://backendimove.daututh79.com/api/... directly without any Nginx changes.
 const adminConsoleRouter = createAdminConsoleRouter({
   getDb: () => db,
   getMatching: () => matching,
   appVersion: APP_VERSION,
-  backendUrl: CORE_PUBLIC_URL,
+  backendUrl: String(process.env.CORE_PUBLIC_URL || 'https://backendimove.daututh79.com'),
 });
 app.use(adminConsoleRouter);
 
@@ -1426,7 +1382,6 @@ async function connectMongo() {
     const pong = await nextDb.command({ ping: 1 });
     if (pong.ok !== 1) throw new Error('MongoDB ping thất bại');
     db = nextDb;
-    await ensureAdminSessionIndexes(db);
     if (DB_REPAIR_ON_START) {
       console.log('[DB REPAIR] Kiểm tra dữ liệu legacy + validator trước khi mở Backend...');
       await repairDatabase({ db: nextDb, client: mongoClient, logger: console });
@@ -1468,11 +1423,11 @@ const server = app.listen(PORT, HOST, () => {
   console.log(` TH79 iMove Core Backend ${APP_VERSION}`);
   console.log('======================================================');
   console.log(`Environment      : ${NODE_ENV}`);
-  console.log(`Listen           : ${CORE_PUBLIC_URL}`);
-  console.log(`Liveness         : ${CORE_PUBLIC_URL}/live`);
-  console.log(`Health           : ${CORE_PUBLIC_URL}/health`);
-  console.log(`Readiness        : ${CORE_PUBLIC_URL}/ready`);
-  console.log(`Public URL       : ${CORE_PUBLIC_URL}`);
+  console.log(`Listen           : http://${HOST}:${PORT}`);
+  console.log(`Liveness         : http://127.0.0.1:${PORT}/live`);
+  console.log(`Health           : http://127.0.0.1:${PORT}/health`);
+  console.log(`Readiness        : http://127.0.0.1:${PORT}/ready`);
+  console.log(`Public URL       : ${String(process.env.CORE_PUBLIC_URL || '(chưa cấu hình)').trim()}`);
   console.log(`Database         : ${DB_NAME}`);
   console.log(`Mongo configured : ${MONGODB_URI ? 'YES' : 'NO'}`);
 
@@ -1514,7 +1469,6 @@ matching = createMatchingEngine({
   getDb: () => db,
   serializeBooking,
   addEvent,
-  getDispatch: () => dispatchEngine,
 });
 matching.start();
 notificationService = createNotificationService({ getDb: () => db });
@@ -1533,7 +1487,6 @@ dispatchEngine.start();
 commerceDispatchWorker = createCommerceDispatchWorker({
   getDb: () => db,
   getNotifications: () => notificationService,
-  getMatching: () => matching,
   intervalMs: Number(process.env.COMMERCE_DISPATCH_INTERVAL_MS || 10000),
 });
 commerceDispatchWorker.start();
