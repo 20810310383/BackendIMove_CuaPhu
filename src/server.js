@@ -32,6 +32,7 @@ const { createPricingService } = require('./pricing_service');
 const { createPricingPublicRouter, createPricingAdminRouter } = require('./pricing_routes');
 const { createPromotionService } = require('./promotion_service');
 const { createPromotionCustomerRouter, createPromotionAdminRouter } = require('./promotion_routes');
+const { createAdBannerPublicRouter, createAdBannerAdminRouter } = require('./ad_banner_routes');
 const { createAnalyticsService } = require('./analytics_service');
 const { createAnalyticsAdminRouter } = require('./analytics_routes');
 const { repairDatabase, completionCollectionForStep, validationDetails } = require('./database_repair');
@@ -697,6 +698,9 @@ app.use('/api/promotions', createPromotionCustomerRouter({ getPromotion:()=>prom
 app.use('/api/v14/admin/services', createServiceCatalogAdminRouter({ getDb:()=>db, getCatalog:()=>serviceCatalogService }));
 app.use('/api/v14/admin/pricing', createPricingAdminRouter({ getDb:()=>db, getPricing:()=>pricingService }));
 app.use('/api/v14/admin/promotions', createPromotionAdminRouter({ getDb:()=>db, getPromotion:()=>promotionService }));
+// V1.8.1: independent marketing banners, image upload to MongoDB GridFS.
+app.use('/api/v181/banners', createAdBannerPublicRouter({ getDb:()=>db }));
+app.use('/api/v181/admin/banners', createAdBannerAdminRouter({ getDb:()=>db }));
 app.use('/api/v14/admin/analytics', createAnalyticsAdminRouter({ getDb:()=>db, getAnalytics:()=>analyticsService }));
 
 // V1.6 Multi-service Commerce + Merchant
