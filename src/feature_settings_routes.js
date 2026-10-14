@@ -17,8 +17,11 @@ function createFeatureSettingsPublicRouter({ getDb }) {
   const router = express.Router();
 
   router.get('/', async (_req, res) => {
+    res.set('Cache-Control', 'no-store, max-age=0');
     try {
-      const settings = await getAppFeatureSettings(getDb());
+      const db = getDb();
+      if (!db) return res.status(503).json({ code: 'DATABASE_UNAVAILABLE', message: 'MongoDB chưa sẵn sàng để đọc cấu hình OTP.' });
+      const settings = await getAppFeatureSettings(db);
       return res.json({ ok: true, settings });
     } catch (error) {
       return res.status(500).json({ message: error.message });
@@ -27,8 +30,10 @@ function createFeatureSettingsPublicRouter({ getDb }) {
 
   // API tương thích cho các app cũ: chỉ trả trạng thái OTP, KHÔNG cấp mã bypass.
   router.post('/registration-bootstrap', async (req, res) => {
+    res.set('Cache-Control', 'no-store, max-age=0');
     try {
       const db = getDb();
+      if (!db) return res.status(503).json({ code: 'DATABASE_UNAVAILABLE', message: 'MongoDB chưa sẵn sàng để kiểm tra OTP.' });
       const settings = await getAppFeatureSettings(db);
       const role = String(req.body?.role || '').trim().toUpperCase();
       const phone = normalizePhone(req.body?.phone);
@@ -71,8 +76,11 @@ function createFeatureSettingsAdminRouter({ getDb }) {
   router.use(requireAdmin);
 
   router.get('/', permit('settings.view'), async (_req, res) => {
+    res.set('Cache-Control', 'no-store, max-age=0');
     try {
-      const settings = await getAppFeatureSettings(getDb());
+      const db = getDb();
+      if (!db) return res.status(503).json({ code: 'DATABASE_UNAVAILABLE', message: 'MongoDB chưa sẵn sàng để tải cấu hình OTP.' });
+      const settings = await getAppFeatureSettings(db);
       return res.json({ ok: true, settings });
     } catch (error) {
       return res.status(500).json({ message: error.message });
@@ -80,8 +88,16 @@ function createFeatureSettingsAdminRouter({ getDb }) {
   });
 
   router.put('/', permit('settings.manage'), async (req, res) => {
+    res.set('Cache-Control', 'no-store, max-age=0');
     try {
       const db = getDb();
+      if (!db) return res.status(503).json({ code: 'DATABASE_UNAVAILABLE', message: 'MongoDB chưa sẵn sàng để lưu cấu hình OTP.' });
+      if (req.body?.otpVerificationEnabled !== undefined && typeof req.body.otpVerificationEnabled !== 'boolean') {
+        return res.status(400).json({ code: 'INVALID_OTP_FLAG', message: 'otpVerificationEnabled phải là true hoặc false.' });
+      }
+      if (req.body?.legalInformationEnabled !== undefined && typeof req.body.legalInformationEnabled !== 'boolean') {
+        return res.status(400).json({ code: 'INVALID_LEGAL_FLAG', message: 'legalInformationEnabled phải là true hoặc false.' });
+      }
       const before = await getAppFeatureSettings(db);
       const settings = await setAppFeatureSettings(
         db,
