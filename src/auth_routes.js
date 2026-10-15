@@ -10,7 +10,7 @@ const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const { sendOtpSms, assertOtpThrottle } = require('./otp_delivery_service');
 const { getAppFeatureSettings } = require('./app_feature_settings');
-const { ObjectId } = require('mongodb');
+const { ObjectId, GridFSBucket } = require('mongodb');
 
 const router = express.Router();
 
@@ -1697,6 +1697,107 @@ function createAuthRouter({
       }
     },
   );
+
+
+  // Profile updates require a live customer JWT. Phone remains immutable here:
+  // changing phone must go through a separate re-verification/OTP flow.
+  router.patch('/me', authenticate, async (req, res) => {
+    try {
+      if (!req.auth.user.roles?.includes('CUSTOMER')) {
+        return res.status(403).json({ message: 'Chỉ tài khoản khách hàng được chỉnh sửa hồ sơ tại đây.' });
+      }
+      const fullName = String(req.body?.fullName ?? '').trim().replace(/\s+/g, ' ');
+      const email = String(req.body?.email ?? '').trim().toLowerCase();
+      if (fullName.length < 2 || fullName.length > 80 || /[\x00-\x1F\x7F]/.test(fullName)) {
+        return res.status(400).json({ message: 'Họ và tên phải có từ 2 đến 80 ký tự hợp lệ.' });
+      }
+      if (email.length > 150 || (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))) {
+        return res.status(400).json({ message: 'Địa chỉ email không hợp lệ.' });
+      }
+      const db = getDb();
+      await db.collection('users').updateOne(
+        { _id: req.auth.user._id, status: 'ACTIVE' },
+        { $set: { fullName, email: email || null, updatedAt: new Date() } },
+      );
+      const user = await db.collection('users').findOne({ _id: req.auth.user._id });
+      return res.json({ ok: true, user: publicUser(user) });
+    } catch (error) {
+      return res.status(500).json({ message: 'Không lưu được thông tin tài khoản.' });
+    }
+  });
+
+  const avatarBody = express.raw({ type: ['image/png', 'image/jpeg', 'image/webp'], limit: '2mb' });
+  router.put('/me/avatar', authenticate, avatarBody, async (req, res) => {
+    if (!req.auth.user.roles?.includes('CUSTOMER')) {
+      return res.status(403).json({ message: 'Không có quyền thay avatar này.' });
+    }
+    const mime = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+    const data = req.body;
+    if (!Buffer.isBuffer(data) || !data.length || data.length > 2 * 1024 * 1024) {
+      return res.status(400).json({ message: 'Ảnh đại diện phải là PNG/JPEG/WebP, tối đa 2 MB.' });
+    }
+    const png = data.length >= 8 && data.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10]));
+    const jpeg = data.length >= 3 && data[0] === 0xff && data[1] === 0xd8 && data[2] === 0xff;
+    const webp = data.length >= 12 && data.toString('ascii', 0, 4) === 'RIFF' && data.toString('ascii', 8, 12) === 'WEBP';
+    if (!((mime === 'image/png' && png) || (mime === 'image/jpeg' && jpeg) || (mime === 'image/webp' && webp))) {
+      return res.status(415).json({ message: 'Định dạng hoặc dữ liệu ảnh không hợp lệ.' });
+    }
+    const db = getDb();
+    const bucket = new GridFSBucket(db, { bucketName: 'user_avatars' });
+    const previous = req.auth.user.avatarFileId;
+    let uploadedId;
+    try {
+      const file = bucket.openUploadStream(`user_${req.auth.user._id}_${Date.now()}`, {
+        contentType: mime,
+        metadata: { userId: req.auth.user._id, purpose: 'CUSTOMER_AVATAR' },
+      });
+      uploadedId = file.id;
+      await new Promise((resolve, reject) => {
+        file.on('finish', resolve);
+        file.on('error', reject);
+        file.end(data);
+      });
+      const avatarUrl = `/api/auth/avatars/${req.auth.user._id}?v=${Date.now()}`;
+      await db.collection('users').updateOne(
+        { _id: req.auth.user._id, status: 'ACTIVE' },
+        { $set: { avatarFileId: uploadedId, avatarUrl, updatedAt: new Date() } },
+      );
+      if (previous) {
+        try { await bucket.delete(previous); } catch (_) { /* best effort cleanup */ }
+      }
+      const user = await db.collection('users').findOne({ _id: req.auth.user._id });
+      return res.json({ ok: true, user: publicUser(user) });
+    } catch (error) {
+      if (uploadedId) {
+        try { await bucket.delete(uploadedId); } catch (_) { /* ignore */ }
+      }
+      return res.status(500).json({ message: 'Không thể lưu ảnh đại diện lên máy chủ.' });
+    }
+  });
+
+  // Public image endpoint; serves only the avatar currently attached to a user.
+  router.get('/avatars/:userId', async (req, res) => {
+    try {
+      if (!ObjectId.isValid(req.params.userId)) return res.sendStatus(404);
+      const db = getDb();
+      const user = await db.collection('users').findOne(
+        { _id: new ObjectId(req.params.userId), avatarFileId: { $exists: true } },
+        { projection: { avatarFileId: 1 } },
+      );
+      if (!user?.avatarFileId) return res.sendStatus(404);
+      const file = await db.collection('user_avatars.files').findOne({ _id: user.avatarFileId });
+      if (!file) return res.sendStatus(404);
+      const contentType = file.contentType || 'application/octet-stream';
+      res.set('Content-Type', contentType);
+      res.set('Cache-Control', 'public, max-age=300');
+      const stream = new GridFSBucket(db, { bucketName: 'user_avatars' }).openDownloadStream(file._id);
+      stream.on('error', () => { if (!res.headersSent) res.sendStatus(404); else res.destroy(); });
+      return stream.pipe(res);
+    } catch (_) {
+      if (!res.headersSent) return res.sendStatus(404);
+      return res.end();
+    }
+  });
 
   // ============================================
   // LOGOUT
