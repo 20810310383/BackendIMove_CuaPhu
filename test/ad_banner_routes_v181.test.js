@@ -79,3 +79,20 @@ test('Admin cannot create enabled banner before uploading an image',async()=>{
   const res=fakeRes();await handler({body:{title:'B',enabled:true}},res);
   assert.equal(res.code,400);assert.match(res.body.message,/ảnh/);
 });
+
+test('Banner v21 public readiness endpoint is discoverable without admin token',async()=>{
+  const router=api.createAdBannerPublicRouter({getDb:()=>({})});
+  const status=router.routes.find(x=>x.method==='get'&&x.route==='/status');
+  assert.ok(status,'v21 readiness endpoint not registered');
+  const response=fakeRes();
+  status.handlers[0]({},response);
+  assert.equal(response.code,200);
+  assert.equal(response.body.ok,true);
+  assert.equal(response.body.patch,'v21');
+});
+
+test('Core server mounts public and authenticated banner routers',()=>{
+  const source=fs.readFileSync(path.resolve(__dirname,'../src/server.js'),'utf8');
+  assert.match(source,/app\.use\('\/api\/v181\/banners',\s*createAdBannerPublicRouter/);
+  assert.match(source,/app\.use\('\/api\/v181\/admin\/banners',\s*createAdBannerAdminRouter/);
+});

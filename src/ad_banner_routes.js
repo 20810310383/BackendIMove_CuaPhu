@@ -56,6 +56,8 @@ function clean(input, prior = {}) {
 }
 function createAdBannerPublicRouter({getDb}) {
   const r = express.Router();
+  // Public deployment smoke-test; does not require Mongo or expose admin data.
+  r.get('/status', (_req, res) => res.set('Cache-Control', 'no-store').json({ok:true,feature:'ad-banners',apiVersion:'v181',patch:'v21'}));
   r.get('/', async (_req,res) => {
     try {
       const now = new Date();
