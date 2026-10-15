@@ -71,7 +71,15 @@ test('Admin và ba ứng dụng cùng sử dụng đúng API và không cần m�
   const settings = file('AdminIMove_CuaPhu/src/LegalSettingsPage.jsx');
   assert.ok(admin.includes("page==='legal-settings'"));
   assert.ok(admin.includes("page==='otp-management'"));
-  assert.ok(settings.includes('async function saveFeatures()'));
+  const otpPanel = file('AdminIMove_CuaPhu/src/RegistrationOtpPanel.jsx');
+  const security = file('AdminIMove_CuaPhu/src/ProductionHealthPage.jsx');
+  assert.ok(admin.includes("'legal-settings','Điều khoản & Bảo mật'"));
+  assert.ok(security.includes('<RegistrationOtpPanel access={access} />'));
+  assert.ok(otpPanel.includes('otpVerificationEnabled: enabled'));
+  assert.ok(otpPanel.includes('/api/v180/admin/app-settings'));
+  assert.ok(!settings.includes('otpVerificationEnabled: visible'));
+  assert.ok(settings.includes("update('enabled', e.target.checked)")); // per-app visibility in v23
+  assert.ok(settings.includes('/api/v171/admin/legal'));
   assert.ok(file('User/lib/pages/register_page.dart').includes("verificationToken = '';"));
   assert.ok(file('Driver/lib/pages/driver_register_page.dart').includes("otpCode: '',"));
   assert.ok(file('Merchant/lib/pages/register_page.dart').includes("await _registerWithOtp('');"));
@@ -79,4 +87,19 @@ test('Admin và ba ứng dụng cùng sử dụng đúng API và không cần m�
     assert.ok(file(`${app}/lib/services/legal_service.dart`).includes('/api/v171/legal'));
     assert.ok(file(`${app}/lib/services/app_feature_settings_service.dart`).includes('/api/v180/app-settings'));
   }
+});
+
+
+test('Cập nhật từng cờ độc lập không ghi đè OTP hay trạng thái hiển thị pháp lý', async () => {
+  const db = fakeDb();
+  await setAppFeatureSettings(db, { otpVerificationEnabled: false, legalInformationEnabled: true }, 'admin');
+  await setAppFeatureSettings(db, { legalInformationEnabled: false }, 'admin');
+  assert.deepEqual(
+    (({ otpVerificationEnabled, legalInformationEnabled }) => ({ otpVerificationEnabled, legalInformationEnabled }))(await getAppFeatureSettings(db)),
+    { otpVerificationEnabled: false, legalInformationEnabled: false },
+  );
+  await setAppFeatureSettings(db, { otpVerificationEnabled: true }, 'admin');
+  const result = await getAppFeatureSettings(db);
+  assert.equal(result.otpVerificationEnabled, true);
+  assert.equal(result.legalInformationEnabled, false);
 });
