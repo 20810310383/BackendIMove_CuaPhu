@@ -105,8 +105,12 @@ function multerStorage() {
     destination: (req, _file, cb) => {
       const owner = String(req.auth?.userId || 'unknown');
       const dir = path.join(uploadRoot, owner);
-      fs.mkdirSync(dir, { recursive: true });
-      cb(null, dir);
+      try {
+        fs.mkdirSync(dir, { recursive: true });
+        cb(null, dir);
+      } catch (error) {
+        cb(error);
+      }
     },
     filename: (_req, file, cb) => {
       cb(null, randomStoredName(file, 'kyc'));
@@ -123,6 +127,32 @@ const upload = multer({
     cb(null, true);
   },
 });
+
+// Multer errors occur BEFORE the route handler and otherwise fall through to
+// Express' default HTML 500 error page. Always return safe JSON for KYC uploads.
+function acceptKycUpload(req, res, next) {
+  upload.single('file')(req, res, (error) => {
+    if (!error) return next();
+
+    const code = error.code || '';
+    const isDisk = ['EACCES', 'EPERM', 'ENOSPC', 'EROFS', 'ENOENT', 'EIO'].includes(code);
+    const status = code === 'LIMIT_FILE_SIZE' ? 413
+      : isDisk ? 503
+        : /Chỉ chấp nhận/.test(error.message || '') ? 415 : 400;
+    // No original file bytes, IDs, JWTs or sensitive local paths in app responses.
+    const message = code === 'LIMIT_FILE_SIZE'
+      ? `File quá lớn, giới hạn ${maxFileMb} MB.`
+      : isDisk
+        ? 'Bộ nhớ lưu hồ sơ trên máy chủ chưa sẵn sàng. Vui lòng thử lại sau.'
+        : status === 415
+          ? 'Chỉ chấp nhận ảnh JPG, PNG, WebP hoặc PDF.'
+          : 'Không thể tải file hồ sơ. Vui lòng chọn lại file hợp lệ.';
+    if (status >= 500) {
+      console.error('[KYC_UPLOAD_STORAGE_ERROR]', code || error.name || 'UNKNOWN');
+    }
+    return res.status(status).json({ ok: false, code: code || 'UPLOAD_REJECTED', message });
+  });
+}
 
 async function getDriver(db, userId) {
   return db.collection('drivers').findOne({ userId });
@@ -315,7 +345,7 @@ function createKycRouter({ getDb }) {
     }
   });
 
-  router.post('/me/avatar', upload.single('file'), async (req, res) => {
+  router.post('/me/avatar', acceptKycUpload, async (req, res) => {
     try {
       if (!req.file) return res.status(400).json({ message: 'Chưa chọn ảnh đại diện.' });
       if (!req.file.mimetype.startsWith('image/')) return res.status(400).json({ message: 'Ảnh đại diện phải là file ảnh.' });
@@ -403,7 +433,7 @@ function createKycRouter({ getDb }) {
     }
   });
 
-  router.post('/driver/documents/:type/:side', requireRole('DRIVER'), upload.single('file'), async (req, res) => {
+  router.post('/driver/documents/:type/:side', requireRole('DRIVER'), acceptKycUpload, async (req, res) => {
     try {
       const type = String(req.params.type || '').toUpperCase();
       const side = String(req.params.side || '').toLowerCase();
@@ -494,7 +524,7 @@ function createKycRouter({ getDb }) {
     }
   });
 
-  router.post('/driver/vehicle/photos/:view', requireRole('DRIVER'), upload.single('file'), async (req, res) => {
+  router.post('/driver/vehicle/photos/:view', requireRole('DRIVER'), acceptKycUpload, async (req, res) => {
     try {
       const view = String(req.params.view || '').toLowerCase();
       if (!VEHICLE_VIEWS.has(view)) return res.status(400).json({ message: 'Góc chụp xe không hợp lệ.' });
