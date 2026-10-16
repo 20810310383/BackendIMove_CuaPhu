@@ -72,10 +72,57 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     return out;
   }
 
+  function lookupIdVariants(value) {
+    const text = String(value || '').trim();
+    const variants = [];
+    if (value !== undefined && value !== null) variants.push(value);
+    if (text) variants.push(text);
+    if (text && ObjectId.isValid(text)) variants.push(new ObjectId(text));
+    return variants;
+  }
+
+  function publicDriverProfile(user, driver) {
+    const source = user || {};
+    return {
+      id: String(source._id || driver?.userId || ''),
+      fullName: source.fullName || driver?.fullName || driver?.name || driver?.driverName || null,
+      phone: source.phone || driver?.phone || driver?.phoneNumber || null,
+      email: source.email || driver?.email || null,
+      avatarUrl: source.avatarUrl || driver?.avatarUrl || null,
+    };
+  }
+
+  function publicDriverOnlineStatus(value) {
+    const status = String(value || '').trim().toUpperCase();
+    return status === 'ONLINE' || status === 'BUSY' ? 'ONLINE' : 'OFFLINE';
+  }
+
   async function getArrayData(key) {
     const collection = db().collection(collectionMap[key]);
     const filter = key === 'customers' && collectionMap.customers === 'users' ? { roles: 'CUSTOMER' } : {};
     const rows = await collection.find(filter).sort({ createdAt: -1, _id: -1 }).toArray();
+
+    if (key === 'drivers') {
+      const userIds = rows.flatMap((driver) => lookupIdVariants(driver.userId));
+      const users = userIds.length
+        ? await db().collection('users').find({ _id: { $in: userIds } }).toArray()
+        : [];
+      const usersById = new Map(users.map((user) => [String(user._id), user]));
+
+      return rows.map((driver) => {
+        const user = usersById.get(String(driver.userId || ''));
+        const profile = publicDriverProfile(user, driver);
+        return serializeDoc({
+          ...driver,
+          user: profile,
+          fullName: profile.fullName || driver.fullName || null,
+          phone: profile.phone || driver.phone || null,
+          email: profile.email || driver.email || null,
+          onlineStatus: publicDriverOnlineStatus(driver.onlineStatus),
+        });
+      });
+    }
+
     return rows.map(serializeDoc);
   }
 
@@ -89,6 +136,12 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
 
     for (const rowRaw of incoming) {
       const row = { ...rowRaw };
+      if (key === 'drivers') {
+        delete row.user;
+        delete row.fullName;
+        delete row.phone;
+        delete row.email;
+      }
       const candidate = String(row.id || row._id || new ObjectId().toString());
       keep.add(candidate);
 

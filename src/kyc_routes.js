@@ -187,7 +187,7 @@ async function ensureDriver(db, userId) {
   return { ...doc, _id: result.insertedId };
 }
 
-function publicUser(user) {
+function publicUser(user = {}) {
   return {
     id: String(user._id),
     phone: user.phone || null,
@@ -197,6 +197,41 @@ function publicUser(user) {
     status: user.status || 'ACTIVE',
     avatar: user.avatar || (user.avatarUrl ? { legacyUrl: user.avatarUrl } : null),
   };
+}
+
+function lookupIdVariants(value) {
+  const text = String(value || '').trim();
+  const variants = [];
+  if (value !== undefined && value !== null) variants.push(value);
+  if (text) variants.push(text);
+  if (text && ObjectId.isValid(text)) variants.push(new ObjectId(text));
+  return variants;
+}
+
+function driverUserFallback(driver = {}) {
+  return {
+    _id: driver.userId || driver._id,
+    fullName: driver.fullName || driver.name || driver.driverName || null,
+    phone: driver.phone || driver.phoneNumber || null,
+    email: driver.email || null,
+    roles: ['DRIVER'],
+    status: driver.status || 'ACTIVE',
+    avatar: driver.avatar || null,
+    avatarUrl: driver.avatarUrl || null,
+  };
+}
+
+async function findUserForDriver(db, driver) {
+  const userIds = lookupIdVariants(driver?.userId);
+  const user = userIds.length
+    ? await db.collection('users').findOne({ _id: { $in: userIds } })
+    : null;
+  return user || driverUserFallback(driver);
+}
+
+function publicDriverOnlineStatus(value) {
+  const status = String(value || '').trim().toUpperCase();
+  return status === 'ONLINE' || status === 'BUSY' ? 'ONLINE' : 'OFFLINE';
 }
 
 function publicDocument(doc) {
@@ -656,15 +691,15 @@ function createKycRouter({ getDb }) {
       const status = String(req.query.status || '').toUpperCase();
       const query = status ? { $or: [{ kycStatus: status }, { approvalStatus: status }] } : {};
       const drivers = await db.collection('drivers').find(query).sort({ updatedAt: -1 }).limit(200).toArray();
-      const userIds = drivers.map((d) => d.userId).filter(Boolean);
+      const userIds = drivers.flatMap((driver) => lookupIdVariants(driver.userId));
       const users = await db.collection('users').find({ _id: { $in: userIds } }).toArray();
       const userMap = new Map(users.map((u) => [String(u._id), u]));
       return res.json(drivers.map((d) => ({
         driverId: String(d._id),
-        user: publicUser(userMap.get(String(d.userId)) || { _id: d.userId }),
+        user: publicUser(userMap.get(String(d.userId)) || driverUserFallback(d)),
         approvalStatus: d.approvalStatus,
         kycStatus: d.kycStatus,
-        onlineStatus: d.onlineStatus,
+        onlineStatus: publicDriverOnlineStatus(d.onlineStatus),
         documentsStatus: d.documentsStatus || {},
         updatedAt: d.updatedAt || null,
       })));
@@ -681,7 +716,7 @@ function createKycRouter({ getDb }) {
       const driver = await db.collection('drivers').findOne({ _id: driverId });
       if (!driver) return res.status(404).json({ message: 'Không tìm thấy tài xế.' });
       const [user, documents, vehicle, bank, logs] = await Promise.all([
-        db.collection('users').findOne({ _id: driver.userId }),
+        findUserForDriver(db, driver),
         db.collection('driver_documents').find({ driverId }).toArray(),
         db.collection('vehicles').findOne({ driverId }, { sort: { updatedAt: -1 } }),
         db.collection('driver_bank_accounts').findOne({ driverId, isDefault: true }),
