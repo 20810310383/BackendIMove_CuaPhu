@@ -105,11 +105,19 @@ function createMatchingAdminRouter({ getDb, getMatching }) {
   router.get('/stats', canView, async (_req, res) => {
     try {
       const matching = engine();
-      const [stats, policy] = await Promise.all([
+      const now = new Date();
+      const [stats, policy, activeOffers] = await Promise.all([
         matching.stats(),
         matching.getMatchingPolicy(),
+        getDb().collection('booking_offers_v69').countDocuments({
+          status: 'PENDING',
+          expiresAt: { $gt: now },
+        }),
       ]);
-      return res.json({ ...stats, policy });
+      // V6.9 is the live dispatch worker. The older driver_offers collection
+      // is only retained for migration compatibility and must not drive the
+      // control-center counters.
+      return res.json({ ...stats, activeOffers, policy, dispatchEngine: 'V69' });
     } catch (error) { return res.status(500).json({ message: error.message }); }
   });
 
@@ -126,8 +134,9 @@ function createMatchingAdminRouter({ getDb, getMatching }) {
         pickup: b.pickup?.address || b.pickup?.addressText || '',
         destination: b.destination?.address || b.destination?.addressText || '',
         customerTotal: Number(b.pricing?.customerTotal || b.pricing?.total || 0),
-        currentDriverId: b.dispatch?.currentDriverId ? String(b.dispatch.currentDriverId) : null,
-        dispatch: b.dispatch || null,
+        currentDriverId: b.driverId ? String(b.driverId) : (b.dispatch?.currentDriverId ? String(b.dispatch.currentDriverId) : null),
+        dispatch: b.dispatchEngine || b.dispatch || null,
+        dispatchEngine: b.dispatchEngine || null,
         createdAt: iso(b.createdAt),
       })));
     } catch (error) { return res.status(500).json({ message: error.message }); }
@@ -207,7 +216,7 @@ function createMatchingAdminRouter({ getDb, getMatching }) {
       const limit = Math.max(1, Math.min(200, Number(req.query.limit || 80)));
       const [adminLogs, offers] = await Promise.all([
         db.collection('matching_admin_logs').find({}).sort({ createdAt: -1 }).limit(limit).toArray(),
-        db.collection('driver_offers').find({}).sort({ sentAt: -1 }).limit(limit).toArray(),
+        db.collection('booking_offers_v69').find({}).sort({ offeredAt: -1 }).limit(limit).toArray(),
       ]);
       return res.json({
         adminLogs: adminLogs.map((x) => ({
@@ -218,10 +227,10 @@ function createMatchingAdminRouter({ getDb, getMatching }) {
         offers: offers.map((x) => ({
           id: String(x._id), bookingId: x.bookingId ? String(x.bookingId) : null,
           driverId: x.driverId ? String(x.driverId) : null, status: x.status,
-          distanceKm: x.distanceToPickupKm ?? null, score: x.matchingScore ?? null,
-          rank: x.matchingRank ?? null, source: x.matchingSource || null,
-          strategy: x.matchingStrategy || null, dispatchMode: x.dispatchMode || null,
-          attemptNo: x.attemptNo || null, sentAt: iso(x.sentAt), respondedAt: iso(x.respondedAt),
+          distanceKm: x.matchingSnapshot?.distanceKm ?? null, score: x.matchingScore ?? null,
+          rank: x.rank ?? null, source: x.matchingSnapshot?.source || 'V69_AUTO',
+          strategy: 'V69_ROUND_DISPATCH', dispatchMode: 'ROUND_BROADCAST',
+          attemptNo: x.round || null, sentAt: iso(x.offeredAt), respondedAt: iso(x.respondedAt),
           expiresAt: iso(x.expiresAt), reason: x.reason || null,
         })),
       });

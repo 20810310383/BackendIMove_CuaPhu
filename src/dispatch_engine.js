@@ -88,7 +88,29 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
 
   async function saveConfig(raw, adminId = null) {
     const cfg = normalizeConfig(raw || {});
-    await getDb().collection('dispatch_configs').updateOne({ key: DEFAULT_CONFIG.key }, { $set: { ...cfg, key: DEFAULT_CONFIG.key, updatedAt: new Date(), updatedBy: adminId } }, { upsert: true });
+    const matching = getMatching?.();
+
+    // Matching Control Center and Live Dispatch expose the same automatic
+    // dispatch switch. Keep the two persisted settings in sync so one screen
+    // cannot say "ĐANG BẬT" while the worker is actually paused.
+    if (matching?.getMatchingPolicy && matching?.saveMatchingPolicy) {
+      const policy = await matching.getMatchingPolicy({ refresh: true });
+      if (Boolean(policy?.autoDispatchEnabled) !== Boolean(cfg.enabled)) {
+        await matching.saveMatchingPolicy({ ...policy, autoDispatchEnabled: cfg.enabled }, adminId);
+      }
+    }
+
+    await getDb().collection('dispatch_configs').updateOne(
+      { key: DEFAULT_CONFIG.key },
+      { $set: { ...cfg, key: DEFAULT_CONFIG.key, updatedAt: new Date(), updatedBy: adminId } },
+      { upsert: true },
+    );
+
+    if (cfg.enabled) {
+      setImmediate(() => resumeSearchingBookings().catch((error) => {
+        console.error('[V6.9 Dispatch resume after config save]', error.message);
+      }));
+    }
     return cfg;
   }
 
@@ -126,7 +148,16 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       booking = await db.collection('bookings').findOne({ _id: bookingId });
     }
     if (!['SEARCHING', 'OFFERED'].includes(booking.status)) return { skipped: true, status: booking.status };
-    const cfg = await getConfig(); if (!cfg.enabled) return { skipped: true, reason: 'DISPATCH_DISABLED' };
+    const cfg = await getConfig();
+    // Admin retry/manual actions are intentionally still available while auto
+    // dispatch is paused. Customer-created bookings, however, must honour the
+    // switch shown in Matching Control Center.
+    const manualIntervention = Boolean(adminId);
+    if (!cfg.enabled && !manualIntervention) return { skipped: true, reason: 'DISPATCH_DISABLED' };
+    const matchingPolicy = await getMatching()?.getMatchingPolicy?.();
+    if (!matchingPolicy?.autoDispatchEnabled && !manualIntervention) {
+      return { skipped: true, reason: 'AUTO_DISPATCH_DISABLED' };
+    }
     const bookingAgeMs = Date.now() - new Date(booking.createdAt || booking.requestedAt || Date.now()).getTime();
     if (bookingAgeMs >= bookingSearchTimeoutSeconds * 1000) {
       clearRetryTimer(bookingId);
@@ -152,7 +183,6 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       return { waitingDriver: true, nextRetryAt };
     }
     const roundCfg = cfg.rounds[nextRound - 1];
-    const matchingPolicy = await getMatching().getMatchingPolicy();
     const preview = await getMatching().previewCandidates(bookingId, { includeNoGps: Boolean(matchingPolicy?.allowNoGpsFallback) });
     const previouslyOffered = new Set((await db.collection('booking_offers_v69').find({ bookingId, dispatchVersion }).project({ driverId: 1 }).toArray()).map(x => String(x.driverId)));
     const candidates = [];
@@ -182,7 +212,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       const driverId = oid(c.driverId); if (!driverId) continue;
       let offer;
       try {
-        const result = await db.collection('booking_offers_v69').insertOne({ bookingId, bookingCode: booking.bookingCode, driverId, round: nextRound, rank: c.rank, matchingScore: c.score, matchingSnapshot: { distanceKm: c.distanceKm, rating: c.rating, acceptanceRate: c.acceptanceRate, completedTripsRecent: c.recentTrips, driverPoints: c.driverPoints, breakdown: c.breakdown || {} }, status: 'PENDING', offeredAt: now, expiresAt, respondedAt: null, dispatchVersion, notification: { socketSent: false, fcmQueued: false, fcmSent: false }, createdAt: now, updatedAt: now });
+        const result = await db.collection('booking_offers_v69').insertOne({ bookingId, bookingCode: booking.bookingCode, driverId, round: nextRound, rank: c.rank, matchingScore: c.score, matchingSnapshot: { source: c.source || 'V69_AUTO', distanceKm: c.distanceKm, rating: c.rating, acceptanceRate: c.acceptanceRate, completedTripsRecent: c.recentTrips, driverPoints: c.driverPoints, breakdown: c.breakdown || {} }, status: 'PENDING', offeredAt: now, expiresAt, respondedAt: null, dispatchVersion, notification: { socketSent: false, fcmQueued: false, fcmSent: false }, createdAt: now, updatedAt: now });
         offer = await db.collection('booking_offers_v69').findOne({ _id: result.insertedId });
       } catch (e) { if (e.code !== 11000) throw e; offer = await db.collection('booking_offers_v69').findOne({ bookingId, driverId, dispatchVersion }); }
       if (!offer) continue;
@@ -350,6 +380,57 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     setImmediate(() => dispatchWithRetry(bookingId).catch(e => console.error('[V6.9 Dispatch next round]', e.message)));
   }
 
+  async function resumeSearchingBookings({ limit = 100 } = {}) {
+    const db = getDb();
+    if (!db) return { resumed: 0, reason: 'DATABASE_UNAVAILABLE' };
+
+    const [cfg, matchingPolicy] = await Promise.all([
+      getConfig(),
+      getMatching()?.getMatchingPolicy?.(),
+    ]);
+    if (!cfg.enabled || !matchingPolicy?.autoDispatchEnabled) {
+      return { resumed: 0, reason: 'AUTO_DISPATCH_DISABLED' };
+    }
+
+    const now = new Date();
+    const strandedBefore = new Date(now.getTime() - 15000);
+    const bookings = await db.collection('bookings').find({
+      status: 'SEARCHING',
+      $or: [
+        { dispatchEngine: { $exists: false }, createdAt: { $lte: strandedBefore } },
+        { 'dispatchEngine.status': { $in: ['QUEUED', 'NEXT_ROUND', 'REQUEUED', 'ADMIN_REQUEUED'] }, updatedAt: { $lte: strandedBefore } },
+        // RETRYING normally exists only for the few milliseconds between the
+        // sweep claiming it and the async retry starting. Recover it only when
+        // it has been stranded by a process restart.
+        { 'dispatchEngine.status': 'RETRYING', updatedAt: { $lte: strandedBefore } },
+        {
+          'dispatchEngine.status': { $in: ['WAITING_NEXT_ROUND', 'WAITING_DRIVER'] },
+          'dispatchEngine.nextRetryAt': { $lte: strandedBefore },
+        },
+      ],
+    }).sort({ createdAt: 1 }).limit(Math.max(1, Math.min(200, Number(limit) || 100))).toArray();
+
+    let resumed = 0;
+    for (const booking of bookings) {
+      const previousStatus = booking.dispatchEngine?.status || null;
+      const claimed = await db.collection('bookings').updateOne(
+        { _id: booking._id, status: 'SEARCHING', 'dispatchEngine.status': previousStatus },
+        { $set: { 'dispatchEngine.status': 'RESUMING', updatedAt: now } },
+      );
+
+      // Documents created before V6.9 have no dispatchEngine.status. MongoDB
+      // equality to null matches both null and absent fields, which lets us
+      // atomically claim those legacy queue items as well.
+      if (!claimed.modifiedCount) continue;
+      resumed += 1;
+      const reset = !booking.dispatchEngine || ['QUEUED', 'REQUEUED', 'ADMIN_REQUEUED'].includes(previousStatus);
+      setImmediate(() => dispatchWithRetry(booking._id, { reset }).catch((error) => {
+        console.error('[V6.9 Dispatch queue recovery]', error.message);
+      }));
+    }
+    return { resumed };
+  }
+
   async function sweepExpiredOffers() {
     const db = getDb(); if (!db) return;
     const now = new Date();
@@ -377,6 +458,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     }
     const rounds = await db.collection('dispatch_rounds_v69').find({ status: 'WAITING', expiresAt: { $lte: now } }).limit(50).toArray();
     for (const r of rounds) await advanceAfterRound(r.bookingId, r.dispatchVersion, r.round, 'TIMEOUT');
+    await resumeSearchingBookings({ limit: 25 });
   }
 
   async function cancelBooking(rawBookingId, reason = 'BOOKING_TERMINAL') {
@@ -437,7 +519,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
   async function start() { if (started) return; started = true; sweepTimer = setInterval(() => sweepExpiredOffers().catch(e => console.error('[V6.9 Dispatch sweep]', e.message)), 1000); sweepTimer.unref?.(); }
   function close() { if (sweepTimer) clearInterval(sweepTimer); sweepTimer = null; for (const timer of retryTimers.values()) clearTimeout(timer); retryTimers.clear(); }
 
-  return { databaseReady, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, activeOfferForDriver, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, start, close, addCooldown };
+  return { databaseReady, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, resumeSearchingBookings, activeOfferForDriver, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, start, close, addCooldown };
 }
 
 module.exports = { createDispatchEngine, DEFAULT_CONFIG, normalizeConfig };

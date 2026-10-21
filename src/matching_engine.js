@@ -53,6 +53,7 @@ function normalizeFindOneAndUpdate(result) {
 function createMatchingEngine({
   server,
   getDb,
+  getDispatch = null,
   serializeBooking,
   addEvent,
 }) {
@@ -1663,11 +1664,12 @@ function createMatchingEngine({
     );
 
     setImmediate(() => {
-      dispatchBooking(requeued._id, { force: true }).catch((error) => {
-        console.error(
-          '[Matching] Dispatch after driver cancel failed:',
-          error.message,
-        );
+      const dispatch = getDispatch?.();
+      const run = dispatch?.dispatchWithRetry
+        ? dispatch.dispatchWithRetry(requeued._id, { reset: true })
+        : dispatchBooking(requeued._id, { force: true });
+      Promise.resolve(run).catch((error) => {
+        console.error('[Matching] Dispatch after driver cancel failed:', error.message);
       });
     });
 
@@ -1754,6 +1756,16 @@ function createMatchingEngine({
   async function resumeSearchingBookings() {
     const db = getDb();
     if (!db || !config.enabled) return;
+
+    // V6.9 owns the production offer lifecycle (rounds, cooldowns, FCM and
+    // idempotency). Matching remains the ranking/GPS provider only. Delegating
+    // recovery here prevents the old driver_offers flow from racing V6.9 after
+    // a restart or after Auto Matching is turned back on.
+    const dispatch = getDispatch?.();
+    if (dispatch?.resumeSearchingBookings) {
+      return dispatch.resumeSearchingBookings();
+    }
+
     const bookings = await db.collection('bookings').find({ status: 'SEARCHING' })
       .sort({ createdAt: 1 }).limit(200).toArray();
     for (const booking of bookings) {

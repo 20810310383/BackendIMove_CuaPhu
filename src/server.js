@@ -891,6 +891,9 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
       serviceCode,
       areaCode,
       status: 'SEARCHING',
+      // Claimed by the V6.9 worker immediately after insert. Persisting this
+      // marker keeps the recovery sweep from racing that first dispatch.
+      dispatchEngine: { status: 'QUEUED', queuedAt: createdAt },
       pickup: {
         address: pickup.address,
         note: pickup.note || null,
@@ -1417,10 +1420,13 @@ async function connectMongo() {
         String(process.env.SEED_DEMO_ON_START || 'false').toLowerCase() === 'true') {
       await ensureDemoDriver();
     }
-    if (matching) await matching.databaseReady();
     if (platformService) await platformService.databaseReady();
     if (notificationService) await notificationService.databaseReady();
     if (dispatchEngine) await dispatchEngine.databaseReady();
+    // Dispatch V6.9 must be initialized before Matching resumes the queue.
+    // Matching delegates queue recovery to it, preventing legacy offers from
+    // being emitted during a restart.
+    if (matching) await matching.databaseReady();
     if (trustService) await trustService.databaseReady();
     if (productionService) await productionService.databaseReady();
     console.log(`[MongoDB Atlas] CONNECTED -> ${DB_NAME}`);
@@ -1488,6 +1494,7 @@ server.on('error', (error) => {
 matching = createMatchingEngine({
   server,
   getDb: () => db,
+  getDispatch: () => dispatchEngine,
   serializeBooking,
   addEvent,
 });
