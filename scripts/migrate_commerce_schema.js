@@ -15,6 +15,8 @@ async function main(){
     ['orders',{merchantId:1,status:1,createdAt:-1},{name:'idx_merchant_orders'}],
     ['orders',{driverId:1,status:1,updatedAt:-1},{name:'idx_driver_orders'}],
     ['orders',{serviceCode:1,status:1,createdAt:1},{name:'idx_dispatch_orders'}],
+    ['orders',{serviceCode:1,createdAt:-1},{name:'idx_commerce_orders_recent'}],
+    ['orders',{serviceCode:1,status:1,createdAt:-1},{name:'idx_commerce_orders_service_status_recent'}],
     ['merchant_settlements',{merchantId:1,periodEnd:-1},{name:'idx_merchant_settlements'}],
   ];
   for(const [collection,key,options] of tasks){await db.collection(collection).createIndex(key,options);console.log(`+ ${collection}.${options.name}`);}

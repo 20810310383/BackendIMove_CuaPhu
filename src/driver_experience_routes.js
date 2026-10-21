@@ -598,14 +598,16 @@ function createDriverExperienceAdminRouter({ getDb, getNotifications = null }) {
       const status = clean(req.query.status || '', 40).toUpperCase();
       const keyword = clean(req.query.q || '', 120).toLowerCase();
       const query = status && status !== 'ALL' ? { status } : {};
+      const requestedLimit = Number(req.query.limit || 100);
+      const limit = Math.max(1, Math.min(200, Number.isFinite(requestedLimit) ? requestedLimit : 100));
       const rows = await getDb().collection('driver_point_topups')
-        .find(query)
+        .find(query, { maxTimeMS: 12000 })
         .sort({ createdAt: -1 })
-        .limit(500)
+        .limit(limit)
         .toArray();
       const driverIds = [...new Set(rows.map((x) => String(x.driverId)))].map(oid).filter(Boolean);
       const drivers = driverIds.length
-        ? await getDb().collection('drivers').find({ _id: { $in: driverIds } }).project({ fullName: 1, phone: 1, userId: 1 }).toArray()
+        ? await getDb().collection('drivers').find({ _id: { $in: driverIds } }, { maxTimeMS: 12000 }).project({ fullName: 1, phone: 1, userId: 1 }).toArray()
         : [];
       const byDriver = new Map(drivers.map((x) => [String(x._id), x]));
       const mapped = rows.map((x) => ({
@@ -629,7 +631,7 @@ function createDriverExperienceAdminRouter({ getDb, getNotifications = null }) {
             x.bankTransactionId,
           ].some((v) => String(v || '').toLowerCase().includes(keyword)))
         : mapped;
-      return res.json({ topups: filtered });
+      return res.json({ topups: filtered, limit });
     } catch (error) { return res.status(500).json({ message: error.message }); }
   });
 

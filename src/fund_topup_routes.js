@@ -16,6 +16,14 @@ function oid(value){try{return value instanceof ObjectId?value:new ObjectId(Stri
 function clean(value,max=240){return String(value??'').trim().slice(0,max);}
 function digits(value){return String(value??'').replace(/\D/g,'');}
 function amount(value){const n=Math.round(Number(value));return Number.isFinite(n)?n:0;}
+async function ensureFundTopupIndexes(db){
+  await Promise.allSettled([
+    db.collection('fund_topup_requests').createIndex({createdAt:-1},{name:'idx_fund_topups_recent'}),
+    db.collection('fund_topup_requests').createIndex({status:1,createdAt:-1},{name:'idx_fund_topups_status_recent'}),
+    db.collection('fund_topup_requests').createIndex({actorType:1,status:1,createdAt:-1},{name:'idx_fund_topups_actor_status_recent'}),
+    db.collection('fund_topup_requests').createIndex({actorUserId:1,targetId:1,createdAt:-1},{name:'idx_fund_topups_owner_recent'}),
+  ]);
+}
 function publicBankConfig(doc={}){
   return {
     bankName: clean(doc.bankName || process.env.COMPANY_BANK_NAME,120),
@@ -262,7 +270,7 @@ function createFundTopupAdminRouter({getDb}){
   r.use(requireAdmin);
 
   r.get('/config',permit('settings.view'),async(_req,res)=>{
-    const doc=await getDb().collection('fund_settings').findOne({_id:'BANK_TRANSFER'});
+    const doc=await getDb().collection('fund_settings').findOne({_id:'BANK_TRANSFER'},{maxTimeMS:8000});
     return res.json({bank:publicBankConfig(doc||{}),minimumAmountVnd:Number(doc?.minimumAmountVnd||50000)});
   });
   r.put('/config',permit('settings.manage'),async(req,res)=>{
@@ -298,8 +306,10 @@ function createFundTopupAdminRouter({getDb}){
     const actorType=clean(req.query.actorType,20).toUpperCase();
     if(status&&status!=='ALL')q.status=status;
     if(actorType&&actorType!=='ALL')q.actorType=actorType;
-    const rows=await getDb().collection('fund_topup_requests').find(q).sort({createdAt:-1}).limit(500).toArray();
-    return res.json({requests:rows.map(serialize)});
+    const requestedLimit=Number(req.query.limit||100);
+    const limit=Math.max(1,Math.min(200,Number.isFinite(requestedLimit)?requestedLimit:100));
+    const rows=await getDb().collection('fund_topup_requests').find(q,{maxTimeMS:12000}).sort({createdAt:-1}).limit(limit).toArray();
+    return res.json({requests:rows.map(serialize),limit});
   });
   r.get('/requests/:id/receipt',permit('settings.view'),async(req,res)=>{
     const id=oid(req.params.id);
@@ -362,4 +372,4 @@ function createFundTopupAdminRouter({getDb}){
   return r;
 }
 
-module.exports={createFundTopupRouter,createFundTopupAdminRouter};
+module.exports={createFundTopupRouter,createFundTopupAdminRouter,ensureFundTopupIndexes};

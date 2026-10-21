@@ -19,7 +19,7 @@ const { createDispatchAdminRouter } = require('./dispatch_admin_routes');
 const { createTrustService } = require('./trust_service');
 const { createTrustRouter, createTrustAdminRouter } = require('./trust_routes');
 const { createBroadcastRouter } = require('./broadcast_routes');
-const { createDriverExperienceRouter, createDriverExperienceAdminRouter, createDriverPointBankWebhookRouter } = require('./driver_experience_routes');
+const { createDriverExperienceRouter, createDriverExperienceAdminRouter, createDriverPointBankWebhookRouter, ensureIndexes: ensureDriverExperienceIndexes } = require('./driver_experience_routes');
 const { createProductionService } = require('./production_service');
 const { createProductionPublicRouter, createProductionDriverRouter, createProductionAdminRouter } = require('./production_routes');
 const helmet = require('helmet');
@@ -36,9 +36,9 @@ const { createAdBannerPublicRouter, createAdBannerAdminRouter } = require('./ad_
 const { createAnalyticsService } = require('./analytics_service');
 const { createAnalyticsAdminRouter } = require('./analytics_routes');
 const { repairDatabase, completionCollectionForStep, validationDetails } = require('./database_repair');
-const { createCommercePublicRouter, createMerchantRouter, createCommerceDriverRouter, createCommerceAdminRouter, createCommerceDispatchWorker } = require('./commerce_routes');
+const { createCommercePublicRouter, createMerchantRouter, createCommerceDriverRouter, createCommerceAdminRouter, createCommerceDispatchWorker, ensureCommerceIndexes } = require('./commerce_routes');
 const { createAdminConsoleRouter } = require('./admin_console_routes');
-const { createFundTopupRouter, createFundTopupAdminRouter } = require('./fund_topup_routes');
+const { createFundTopupRouter, createFundTopupAdminRouter, ensureFundTopupIndexes } = require('./fund_topup_routes');
 const { createLegalPublicRouter, createLegalAdminRouter } = require('./legal_routes');
 const { createFeatureSettingsPublicRouter, createFeatureSettingsAdminRouter } = require('./feature_settings_routes');
 const { createOtpAdminRouter } = require('./otp_admin_routes');
@@ -1404,6 +1404,11 @@ async function connectMongo() {
     } else {
       console.log('[DB REPAIR] Bỏ qua auto-repair khi startup (DB_REPAIR_ON_START=false).');
     }
+    await Promise.all([
+      ensureCommerceIndexes(nextDb),
+      ensureDriverExperienceIndexes(nextDb),
+      ensureFundTopupIndexes(nextDb),
+    ]);
     await adminConsoleRouter.ensureAdminRbacSeed();
     console.log('[Admin Console] RBAC routes + indexes READY (merged into Core).');
     mongoConnected = true;

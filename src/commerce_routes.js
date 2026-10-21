@@ -10,6 +10,9 @@ const ORDER_STATUSES = [
   'CREATED','WAITING_MERCHANT','MERCHANT_ACCEPTED','PREPARING','READY_FOR_PICKUP',
   'DRIVER_ASSIGNED','DRIVER_AT_MERCHANT','PICKED_UP','DELIVERING','DELIVERED','COMPLETED','CANCELLED'
 ];
+const COMMERCE_SERVICE_CODES = ['FOOD','ERRAND','DELIVERY'];
+const ADMIN_COMMERCE_ORDERS_LIMIT = 100;
+const ADMIN_COMMERCE_ORDERS_MAX_LIMIT = 200;
 const MERCHANT_TRANSITIONS = {
   WAITING_MERCHANT: ['MERCHANT_ACCEPTED','CANCELLED'],
   MERCHANT_ACCEPTED: ['PREPARING','READY_FOR_PICKUP','CANCELLED'],
@@ -79,6 +82,21 @@ async function priceDeliveryExtras({db,baseFee,details,user}){
 
 function oid(value) {
   try { return new ObjectId(String(value)); } catch (_) { return null; }
+}
+
+async function ensureCommerceIndexes(db) {
+  await Promise.all([
+    db.collection('orders').createIndex(
+      { serviceCode: 1, createdAt: -1 },
+      { name: 'idx_commerce_orders_recent' },
+    ),
+    db.collection('orders').createIndex(
+      { serviceCode: 1, status: 1, createdAt: -1 },
+      { name: 'idx_commerce_orders_service_status_recent' },
+    ),
+  ]).catch((error) => {
+    console.warn('[COMMERCE INDEX]', error.message);
+  });
 }
 function serialize(value) {
   if (!value) return value;
@@ -617,7 +635,24 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
   r.put('/delivery-policy',permit('orders.view'),async(req,res)=>{try{const db=getDb(),now=new Date();const current=await getDeliveryPolicy(db);const policy={standard:normalizeFeeRule(req.body?.standard,current.standard),priority:normalizeFeeRule(req.body?.priority,current.priority),fragile:normalizeFeeRule(req.body?.fragile,current.fragile),cod:{enabled:Boolean(req.body?.cod?.enabled),requireKyc:req.body?.cod?.requireKyc!==false},updatedAt:now,updatedBy:req.admin._id};await db.collection('commerce_settings').updateOne({_id:'DELIVERY_FEE_POLICY'},{$set:policy},{upsert:true});await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'DELIVERY_POLICY_UPDATE',entityType:'COMMERCE_SETTING',entityId:'DELIVERY_FEE_POLICY',after:policy,createdAt:now});res.json({policy});}catch(e){res.status(400).json({message:e.message});}});
   r.get('/merchants',permit('merchants.view'),async(req,res)=>{try{const rows=await getDb().collection('merchants').find({}).sort({createdAt:-1}).limit(500).toArray();res.json({merchants:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
   r.put('/merchants/:id',permit('merchants.manage'),async(req,res)=>{try{const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});const patch={};for(const k of ['status','name','commissionRate','categoryCode','merchantType','merchantTypeLabel','categoryName','logoUrl','coverUrl'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id},{$set:patch});await getDb().collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'MERCHANT_UPDATE',entityType:'MERCHANT',entityId:String(_id),after:patch,createdAt:new Date()});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id}))});}catch(e){res.status(400).json({message:e.message});}});
-  r.get('/orders',permit('orders.view'),async(req,res)=>{try{const q={};if(req.query.status)q.status=String(req.query.status).toUpperCase();if(req.query.serviceCode)q.serviceCode=String(req.query.serviceCode).toUpperCase();const rows=await getDb().collection('orders').find(q).sort({createdAt:-1}).limit(500).toArray();res.json({orders:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
+  r.get('/orders',permit('orders.view'),async(req,res)=>{
+    try{
+      const q={serviceCode:{$in:COMMERCE_SERVICE_CODES}};
+      if(req.query.status)q.status=String(req.query.status).toUpperCase();
+      if(req.query.serviceCode){
+        const serviceCode=String(req.query.serviceCode).toUpperCase();
+        if(!COMMERCE_SERVICE_CODES.includes(serviceCode))return res.status(400).json({message:'serviceCode commerce không hợp lệ.'});
+        q.serviceCode=serviceCode;
+      }
+      const requestedLimit=Number(req.query.limit||ADMIN_COMMERCE_ORDERS_LIMIT);
+      const limit=Math.max(1,Math.min(ADMIN_COMMERCE_ORDERS_MAX_LIMIT,Number.isFinite(requestedLimit)?requestedLimit:ADMIN_COMMERCE_ORDERS_LIMIT));
+      const rows=await getDb().collection('orders').find(q,{maxTimeMS:12000}).sort({createdAt:-1}).limit(limit).toArray();
+      res.json({orders:rows.map(serialize),limit});
+    }catch(e){
+      const timedOut=e?.code===50||/time limit|maxtime/i.test(String(e?.message||''));
+      res.status(timedOut?503:500).json({code:timedOut?'COMMERCE_QUERY_TIMEOUT':'COMMERCE_QUERY_FAILED',message:timedOut?'Truy vấn đơn commerce quá thời gian. Backend sẽ tự thử lại khi dữ liệu sẵn sàng.':e.message});
+    }
+  });
   r.get('/orders/:id/candidates',permit('orders.view'),async(req,res)=>{
     try{
       const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Order ID không hợp lệ.'});
@@ -663,4 +698,4 @@ function createCommerceDispatchWorker({getDb,getNotifications,intervalMs=10000})
   return {start(){if(timer)return;timer=setInterval(tick,Math.max(5000,Number(intervalMs)||10000));timer.unref?.();setTimeout(tick,1500);},close(){if(timer)clearInterval(timer);timer=null;}};
 }
 
-module.exports={createCommercePublicRouter,createMerchantRouter,createCommerceDriverRouter,createCommerceAdminRouter,createCommerceDispatchWorker,ORDER_STATUSES};
+module.exports={createCommercePublicRouter,createMerchantRouter,createCommerceDriverRouter,createCommerceAdminRouter,createCommerceDispatchWorker,ensureCommerceIndexes,ORDER_STATUSES};
