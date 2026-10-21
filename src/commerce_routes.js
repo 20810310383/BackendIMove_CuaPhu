@@ -11,7 +11,9 @@ const ORDER_STATUSES = [
   'DRIVER_ASSIGNED','DRIVER_AT_MERCHANT','PICKED_UP','DELIVERING','DELIVERED','COMPLETED','CANCELLED'
 ];
 const COMMERCE_SERVICE_CODES = ['FOOD','ERRAND','DELIVERY'];
-const ADMIN_COMMERCE_ORDERS_LIMIT = 100;
+// Keep the operations feed small and page it on the server so a slow MongoDB
+// connection does not need to read every commerce order for one screen.
+const ADMIN_COMMERCE_ORDERS_LIMIT = 20;
 const ADMIN_COMMERCE_ORDERS_MAX_LIMIT = 200;
 const MERCHANT_TRANSITIONS = {
   WAITING_MERCHANT: ['MERCHANT_ACCEPTED','CANCELLED'],
@@ -646,8 +648,16 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
       }
       const requestedLimit=Number(req.query.limit||ADMIN_COMMERCE_ORDERS_LIMIT);
       const limit=Math.max(1,Math.min(ADMIN_COMMERCE_ORDERS_MAX_LIMIT,Number.isFinite(requestedLimit)?requestedLimit:ADMIN_COMMERCE_ORDERS_LIMIT));
-      const rows=await getDb().collection('orders').find(q,{maxTimeMS:12000}).sort({createdAt:-1}).limit(limit).toArray();
-      res.json({orders:rows.map(serialize),limit});
+      const requestedPage=Number(req.query.page||1);
+      const page=Math.max(1,Math.min(10000,Number.isFinite(requestedPage)?Math.floor(requestedPage):1));
+      // Fetch one extra record instead of countDocuments: it keeps this query
+      // index-friendly while still letting the web app enable "Trang sau".
+      const rows=await getDb().collection('orders').find(q,{
+        maxTimeMS:12000,
+        projection:{orderCode:1,serviceCode:1,merchantId:1,merchantSnapshot:1,pickup:1,customerSnapshot:1,status:1,dispatchStatus:1,dispatchCandidateCount:1,dispatchTriggeredBy:1,driverId:1,total:1,deliveryFee:1,createdAt:1},
+      }).sort({createdAt:-1}).skip((page-1)*limit).limit(limit+1).toArray();
+      const hasNext=rows.length>limit;
+      res.json({orders:rows.slice(0,limit).map(serialize),limit,page,hasNext,hasPrevious:page>1});
     }catch(e){
       const timedOut=e?.code===50||/time limit|maxtime/i.test(String(e?.message||''));
       res.status(timedOut?503:500).json({code:timedOut?'COMMERCE_QUERY_TIMEOUT':'COMMERCE_QUERY_FAILED',message:timedOut?'Truy vấn đơn commerce quá thời gian. Backend sẽ tự thử lại khi dữ liệu sẵn sàng.':e.message});

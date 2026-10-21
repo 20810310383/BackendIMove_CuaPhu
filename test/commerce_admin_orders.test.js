@@ -21,6 +21,7 @@ test('commerce admin feed only queries commerce services and clamps the result s
   let query;
   let options;
   let limit;
+  let skip;
   const db = {
     collection() {
       return {
@@ -30,6 +31,10 @@ test('commerce admin feed only queries commerce services and clamps the result s
           return {
             sort() {
               return {
+                skip(nextSkip) {
+                  skip = nextSkip;
+                  return this;
+                },
                 limit(nextLimit) {
                   limit = nextLimit;
                   return { toArray: async () => [{ _id: 'order-1', serviceCode: 'FOOD' }] };
@@ -48,9 +53,11 @@ test('commerce admin feed only queries commerce services and clamps the result s
   assert.equal(query.serviceCode, 'FOOD');
   assert.equal(query.status, 'CREATED');
   assert.equal(options.maxTimeMS, 12000);
-  assert.equal(limit, 200);
+  assert.equal(skip, 0);
+  assert.equal(limit, 201);
   assert.equal(res.code, 200);
   assert.equal(res.body.limit, 200);
+  assert.equal(res.body.page, 1);
 });
 
 test('commerce admin feed rejects a non-commerce service before querying MongoDB', async () => {
@@ -58,6 +65,43 @@ test('commerce admin feed rejects a non-commerce service before querying MongoDB
   await adminOrdersHandler({ collection() { throw new Error('MongoDB must not be queried'); } })({ query: { serviceCode: 'BIKE' } }, res);
   assert.equal(res.code, 400);
   assert.match(res.body.message, /commerce không hợp lệ/);
+});
+
+test('commerce admin feed defaults to 20 rows for the first operations page', async () => {
+  let limit;
+  const db = {
+    collection() {
+      return {
+        find() {
+          return { sort() { return { skip() { return this; }, limit(nextLimit) { limit = nextLimit; return { toArray: async () => [] }; } }; } };
+        },
+      };
+    },
+  };
+
+  const res = response();
+  await adminOrdersHandler(db)({ query: {} }, res);
+  assert.equal(limit, 21);
+  assert.equal(res.body.limit, 20);
+  assert.equal(res.body.page, 1);
+  assert.equal(res.body.hasNext, false);
+});
+
+test('commerce admin feed skips prior pages and signals a next page without a full count', async () => {
+  let skip;
+  let limit;
+  const rows=Array.from({length:21},(_,index)=>({_id:`order-${index}`,serviceCode:'FOOD'}));
+  const db={collection(){return {find(){return {sort(){return {skip(nextSkip){skip=nextSkip;return this;},limit(nextLimit){limit=nextLimit;return {toArray:async()=>rows};}};}};}};}};
+
+  const res=response();
+  await adminOrdersHandler(db)({query:{page:'3',limit:'20'}},res);
+
+  assert.equal(skip,40);
+  assert.equal(limit,21);
+  assert.equal(res.body.page,3);
+  assert.equal(res.body.hasPrevious,true);
+  assert.equal(res.body.hasNext,true);
+  assert.equal(res.body.orders.length,20);
 });
 
 test('commerce indexes cover recent and status-filtered order feeds', async () => {
