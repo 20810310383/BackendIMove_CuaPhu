@@ -7,6 +7,8 @@ const crypto = require('crypto');
 const { createAuthenticate } = require('./auth_routes');
 const { createAdminGuard } = require('./admin_guard');
 const { verifiedMetrics } = require('./trusted_route_pricing');
+const { DOCUMENT_TYPES, reviewStatus, missingReviewItems, reviewSummary } = require('./merchant_review_policy');
+const {storageRoot} = require('./local_storage_service');
 
 const ORDER_STATUSES = [
   'CREATED','WAITING_MERCHANT','MERCHANT_ACCEPTED','PREPARING','READY_FOR_PICKUP',
@@ -103,6 +105,16 @@ async function ensureCommerceIndexes(db) {
     console.warn('[COMMERCE INDEX]', error.message);
   });
 }
+function adminMerchantRecord(merchant) {
+  const record=serialize(merchant);
+  delete record.reviewDocuments;
+  return {...record,...reviewSummary(merchant)};
+}
+function publicMerchantRecord(merchant) {
+  const record=serialize(merchant);
+  for (const key of ['reviewDocuments','reviewReason','reviewedBy','reviewedAt','approvalStatus','submittedAt']) delete record[key];
+  return record;
+}
 function serialize(value) {
   if (!value) return value;
   const out = { ...value };
@@ -119,6 +131,40 @@ const MERCHANT_MEDIA_ROOT = path.resolve(
   String(process.env.LOCAL_UPLOAD_ROOT || 'storage').trim() || 'storage',
   'merchant',
 );
+
+// Sensitive verification files are never mounted by the public merchant-media route.
+const MERCHANT_REVIEW_ROOT = path.join(storageRoot, 'private', 'merchant_review');
+const merchantReviewUpload = multer({
+  storage: multer.diskStorage({
+    destination(req, _file, cb) {
+      const folder=path.join(MERCHANT_REVIEW_ROOT,String(req.merchantContext.merchant._id));
+      fs.mkdirSync(folder,{recursive:true,mode:0o700});cb(null,folder);
+    },
+    filename(_req,_file,cb) {cb(null,crypto.randomBytes(20).toString('hex')+'.img');},
+  }),
+  limits:{fileSize:5*1024*1024,files:1},
+  fileFilter(_req,file,cb) {
+    cb(null,['image/jpeg','image/png','image/webp'].includes(String(file.mimetype||'').toLowerCase()));
+  },
+});
+function verifiedReviewMime(buffer) {
+  if(buffer.length>=3&&buffer[0]===0xff&&buffer[1]===0xd8&&buffer[2]===0xff)return 'image/jpeg';
+  if(buffer.length>=8&&buffer.subarray(0,8).equals(Buffer.from('89504e470d0a1a0a','hex')))return 'image/png';
+  if(buffer.length>=12&&buffer.toString('ascii',0,4)==='RIFF'&&buffer.toString('ascii',8,12)==='WEBP')return 'image/webp';
+  return null;
+}
+function sendReviewDocument(res,merchant,kind) {
+  const doc=merchant?.reviewDocuments?.[kind];
+  const filename=String(doc?.filename||'');
+  if(!/^[a-f0-9]{40}\.img$/.test(filename))return res.status(404).json({message:'Chưa có giấy tờ.'});
+  const filepath=path.join(MERCHANT_REVIEW_ROOT,String(merchant._id),filename);
+  if(!fs.existsSync(filepath))return res.status(404).json({message:'Không tìm thấy tệp hồ sơ.'});
+  res.setHeader('Content-Type',doc.mime||'application/octet-stream');
+  res.setHeader('Cache-Control','private, no-store');
+  res.setHeader('X-Content-Type-Options','nosniff');
+  res.setHeader('Content-Disposition','inline; filename="ho-so-'+kind.toLowerCase()+'.img"');
+  return res.sendFile(filepath);
+}
 
 function merchantMediaExtension(file) {
   const mime = String(file?.mimetype || '').toLowerCase();
@@ -388,12 +434,13 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
       if (req.query.category) q.categoryCode = String(req.query.category).toUpperCase();
       if (req.query.merchantType) q.merchantType = String(req.query.merchantType).toUpperCase();
       const rows = await getDb().collection('merchants').find(q).sort({ rating:-1, name:1 }).limit(100).toArray();
-      res.json({ merchants: rows.map(serialize) });
+      res.json({ merchants: rows.filter(m=>reviewStatus(m)==='APPROVED').map(publicMerchantRecord) });
     } catch (e) { res.status(500).json({ message:e.message }); }
   });
   r.get('/merchants/:id/products', async (req,res) => {
     try {
       const merchantId = oid(req.params.id); if (!merchantId) return res.status(400).json({message:'Merchant ID không hợp lệ.'});
+      const listedMerchant=await getDb().collection('merchants').findOne({_id:merchantId,status:{$in:['ACTIVE','OPEN','BUSY']}});if(!listedMerchant||reviewStatus(listedMerchant)!=='APPROVED')return res.status(404).json({message:'Cửa hàng chưa sẵn sàng nhận đơn.'});
       const products = await getDb().collection('products').find({ merchantId, status:'ACTIVE' }).sort({categoryName:1,sortOrder:1,name:1}).toArray();
       res.json({ products: products.map(serialize) });
     } catch (e) { res.status(500).json({ message:e.message }); }
@@ -438,6 +485,7 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
       if (merchantId) {
         merchant = await db.collection('merchants').findOne({_id:merchantId,status:{$nin:['SUSPENDED','CLOSED_PERMANENTLY']}});
         if(!merchant) return res.status(404).json({message:'Không tìm thấy cửa hàng đang hoạt động.'});
+        if(reviewStatus(merchant)!=='APPROVED'||!['ACTIVE','BUSY','OPEN'].includes(String(merchant.status).toUpperCase()))return res.status(409).json({message:'Cửa hàng chưa được duyệt hoặc đang tạm ngừng.'});
       }
       const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
       const items = [];
@@ -514,6 +562,13 @@ function createMerchantRouter({ getDb, getNotifications }) {
   const r = express.Router();
   r.use(...createRequireMerchant(getDb));
   r.get('/me', (req,res)=>res.json({user:serialize(req.auth.user),membership:serialize(req.merchantContext.membership),merchant:serialize(req.merchantContext.merchant)}));
+  // Merchants pending approval may edit their identity and upload evidence, but may not trade.
+  r.use((req,res,next)=>{
+    if (/^\/(?:me|store|verification)(?:\/|$)/.test(req.path)) return next();
+    if (reviewStatus(req.merchantContext.merchant)!=='APPROVED')
+      return res.status(403).json({code:'MERCHANT_NOT_APPROVED',message:'Hồ sơ cửa hàng chưa được Admin duyệt.'});
+    return next();
+  });
   r.get('/dashboard', async (req,res)=>{
     try{
       const db=getDb(), merchantId=req.merchantContext.merchant._id;
@@ -588,7 +643,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
   });
   r.get('/store', (req,res)=>res.json({merchant:serialize(req.merchantContext.merchant)}));
   r.put('/store', async (req,res)=>{
-    try{const patch={};for(const k of ['name','address','phone','description','status','openingHours','pickupInstruction','logoUrl','coverUrl','categoryName'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];if(req.body?.merchantType!==undefined){const type=String(req.body.merchantType).toUpperCase();if(!['STORE','RESTAURANT'].includes(type))return res.status(400).json({message:'merchantType phải là STORE hoặc RESTAURANT.'});patch.merchantType=type;patch.merchantTypeLabel=type==='RESTAURANT'?'Nhà hàng · Food':'Cửa hàng · Đặt hộ';patch.categoryCode=type==='RESTAURANT'?'FOOD':'ERRAND';}patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id:req.merchantContext.merchant._id},{$set:patch});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id}))});}catch(e){res.status(400).json({message:e.message});}
+    try{const patch={};for(const k of ['name','address','description','openingHours','pickupInstruction','categoryName'])if(req.body?.[k]!==undefined)patch[k]=String(req.body[k]).slice(0,400);if(req.body?.status!==undefined){const status=String(req.body.status).toUpperCase();if(!['ACTIVE','BUSY','PAUSED'].includes(status))return res.status(400).json({message:'Trạng thái hoạt động không hợp lệ.'});if(reviewStatus(req.merchantContext.merchant)!=='APPROVED')return res.status(403).json({message:'Cửa hàng chưa được duyệt, không thể mở nhận đơn.'});patch.status=status;}if(reviewStatus(req.merchantContext.merchant)==='APPROVED' && (req.body?.name!==undefined || req.body?.address!==undefined || req.body?.merchantType!==undefined))return res.status(409).json({message:'Thay đổi tên, địa chỉ hoặc loại hình cửa hàng đã duyệt cần liên hệ Admin.'});if(req.body?.merchantType!==undefined){const type=String(req.body.merchantType).toUpperCase();if(!['STORE','RESTAURANT'].includes(type))return res.status(400).json({message:'merchantType phải là STORE hoặc RESTAURANT.'});patch.merchantType=type;patch.merchantTypeLabel=type==='RESTAURANT'?'Nhà hàng · Food':'Cửa hàng · Đặt hộ';patch.categoryCode=type==='RESTAURANT'?'FOOD':'ERRAND';}patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id:req.merchantContext.merchant._id},{$set:patch});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id}))});}catch(e){res.status(400).json({message:e.message});}
   });
   r.post('/store/media/:kind', merchantMediaUpload.single('image'), async (req,res)=>{
     try {
@@ -610,6 +665,45 @@ function createMerchantRouter({ getDb, getNotifications }) {
       if(req.file?.path)fs.promises.unlink(req.file.path).catch(()=>{});
       return res.status(400).json({message:e.message});
     }
+  });
+  r.get('/verification', async(req,res)=>{
+    const merchant=await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id});
+    return res.json({verification:reviewSummary(merchant)});
+  });
+  r.post('/verification/documents/:kind', (req,res,next)=>{
+    if(!DOCUMENT_TYPES.includes(String(req.params.kind||'').toUpperCase()))return res.status(400).json({message:'Loại giấy tờ không hợp lệ.'});
+    if(reviewStatus(req.merchantContext.merchant)==='APPROVED')return res.status(409).json({message:'Hồ sơ đã duyệt; liên hệ Admin nếu cần thay đổi giấy tờ.'});
+    return next();
+  },merchantReviewUpload.single('image'),async(req,res)=>{
+    try{
+      if(!req.file)return res.status(400).json({message:'Chọn ảnh JPG, PNG hoặc WEBP dưới 5 MB.'});
+      const magic=verifiedReviewMime(await fs.promises.readFile(req.file.path));
+      if(!magic){await fs.promises.unlink(req.file.path).catch(()=>{});return res.status(400).json({message:'File ảnh không hợp lệ.'});}
+      const merchantId=req.merchantContext.merchant._id,kind=String(req.params.kind).toUpperCase();
+      const d={filename:req.file.filename,originalName:path.basename(String(req.file.originalname||'image')).slice(0,120),size:req.file.size,mime:magic,uploadedAt:new Date()};
+      const before=await getDb().collection('merchants').findOne({_id:merchantId});
+      const updated=await getDb().collection('merchants').updateOne({_id:merchantId,approvalStatus:{$ne:'APPROVED'},status:{$ne:'ACTIVE'}},{$set:{['reviewDocuments.'+kind]:d,updatedAt:new Date()}});
+      if(!updated.matchedCount){await fs.promises.unlink(req.file.path).catch(()=>{});return res.status(409).json({message:'Trạng thái hồ sơ vừa thay đổi.'});}
+      const old=before?.reviewDocuments?.[kind]?.filename;
+      if(old && /^[a-f0-9]{40}\.img$/.test(old) && old!==d.filename)fs.promises.unlink(path.join(MERCHANT_REVIEW_ROOT,String(merchantId),old)).catch(()=>{});
+      return res.json({verification:reviewSummary(await getDb().collection('merchants').findOne({_id:merchantId}))});
+    }catch(e){if(req.file?.path)await fs.promises.unlink(req.file.path).catch(()=>{});return res.status(500).json({message:'Không lưu được giấy tờ.'});}
+  });
+  r.post('/verification/submit',async(req,res)=>{
+    try {
+      const db=getDb(),id=req.merchantContext.merchant._id,merchant=await db.collection('merchants').findOne({_id:id});
+      if(reviewStatus(merchant)==='APPROVED')return res.status(409).json({message:'Hồ sơ đã được duyệt.'});
+      const missing=missingReviewItems(merchant);if(missing.length)return res.status(400).json({message:'Hồ sơ chưa đầy đủ.',missing});
+      const result=await db.collection('merchants').updateOne({_id:id,approvalStatus:{$ne:'APPROVED'},status:{$in:['PENDING','REJECTED']}},{$set:{approvalStatus:'PENDING',status:'PENDING',reviewReason:'',submittedAt:new Date(),updatedAt:new Date()}});
+      if(!result.matchedCount)return res.status(409).json({message:'Không thể gửi lại hồ sơ ở trạng thái này.'});
+      return res.json({verification:reviewSummary(await db.collection('merchants').findOne({_id:id}))});
+    }catch(e){return res.status(500).json({message:'Gửi hồ sơ thất bại.'});}
+  });
+  r.get('/verification/documents/:kind',async(req,res)=>{
+    const merchant=await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id});
+    const kind=String(req.params.kind||'').toUpperCase();
+    if(!DOCUMENT_TYPES.includes(kind))return res.status(400).json({message:'Loại giấy tờ không hợp lệ.'});
+    return sendReviewDocument(res,merchant,kind);
   });
   r.get('/settlements', async (req,res)=>{try{const rows=await getDb().collection('merchant_settlements').find({merchantId:req.merchantContext.merchant._id}).sort({periodEnd:-1,createdAt:-1}).limit(100).toArray();res.json({settlements:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
   return r;
@@ -673,8 +767,46 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
   const r=express.Router();const {requireAdmin,permit}=createAdminGuard({getDb});r.use(requireAdmin);
   r.get('/delivery-policy',permit('orders.view'),async(_req,res)=>{try{res.json({policy:await getDeliveryPolicy(getDb())});}catch(e){res.status(500).json({message:e.message});}});
   r.put('/delivery-policy',permit('orders.policy.manage'),async(req,res)=>{try{const db=getDb(),now=new Date();const current=await getDeliveryPolicy(db);const policy={standard:normalizeFeeRule(req.body?.standard,current.standard),priority:normalizeFeeRule(req.body?.priority,current.priority),fragile:normalizeFeeRule(req.body?.fragile,current.fragile),cod:{enabled:Boolean(req.body?.cod?.enabled),requireKyc:req.body?.cod?.requireKyc!==false},updatedAt:now,updatedBy:req.admin._id};await db.collection('commerce_settings').updateOne({_id:'DELIVERY_FEE_POLICY'},{$set:policy},{upsert:true});await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'DELIVERY_POLICY_UPDATE',entityType:'COMMERCE_SETTING',entityId:'DELIVERY_FEE_POLICY',after:policy,createdAt:now});res.json({policy});}catch(e){res.status(400).json({message:e.message});}});
-  r.get('/merchants',permit('merchants.view'),async(req,res)=>{try{const rows=await getDb().collection('merchants').find({}).sort({createdAt:-1}).limit(500).toArray();res.json({merchants:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
-  r.put('/merchants/:id',permit('merchants.manage'),async(req,res)=>{try{const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});const patch={};for(const k of ['status','name','commissionRate','categoryCode','merchantType','merchantTypeLabel','categoryName','logoUrl','coverUrl'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id},{$set:patch});await getDb().collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'MERCHANT_UPDATE',entityType:'MERCHANT',entityId:String(_id),after:patch,createdAt:new Date()});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id}))});}catch(e){res.status(400).json({message:e.message});}});
+  r.get('/merchants',permit('merchants.view'),async(req,res)=>{try{const rows=await getDb().collection('merchants').find({}).sort({createdAt:-1}).limit(500).toArray();res.json({merchants:rows.map(adminMerchantRecord)});}catch(e){res.status(500).json({message:e.message});}});
+  r.get('/merchants/:id',permit('merchants.view'),async(req,res)=>{
+    const id=oid(req.params.id);if(!id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});
+    const merchant=await getDb().collection('merchants').findOne({_id:id});
+    if(!merchant)return res.status(404).json({message:'Không tìm thấy cửa hàng.'});
+    return res.json({merchant:adminMerchantRecord(merchant)});
+  });
+  r.get('/merchants/:id/documents/:kind',permit('merchants.approve'),async(req,res)=>{
+    const id=oid(req.params.id),kind=String(req.params.kind||'').toUpperCase();
+    if(!id||!DOCUMENT_TYPES.includes(kind))return res.status(400).json({message:'Yêu cầu không hợp lệ.'});
+    const merchant=await getDb().collection('merchants').findOne({_id:id});
+    if(!merchant)return res.status(404).json({message:'Không tìm thấy cửa hàng.'});
+    return sendReviewDocument(res,merchant,kind);
+  });
+  r.post('/merchants/:id/review',permit('merchants.approve'),async(req,res)=>{
+    try{
+      const id=oid(req.params.id);if(!id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});
+      const decision=String(req.body?.decision||'').toUpperCase();
+      if(!['APPROVE','REJECT'].includes(decision))return res.status(400).json({message:'Quyết định không hợp lệ.'});
+      const reason=String(req.body?.reason||'').trim().slice(0,500);
+      if(decision==='REJECT' && reason.length<8)return res.status(400).json({message:'Cần nhập lý do từ chối (tối thiểu 8 ký tự).'});
+      const db=getDb(),current=await db.collection('merchants').findOne({_id:id});
+      if(!current)return res.status(404).json({message:'Không tìm thấy cửa hàng.'});
+      if(reviewStatus(current)!=='PENDING')return res.status(409).json({message:'Chỉ được xét duyệt hồ sơ đang chờ xử lý.'});
+      if(decision==='APPROVE'){
+        const missing=missingReviewItems(current);
+        if(missing.length)return res.status(422).json({message:'Hồ sơ chưa đủ điều kiện duyệt.',missing});
+      }
+      const now=new Date(),next=decision==='APPROVE'?'APPROVED':'REJECTED';
+      const filter={_id:id,status:'PENDING',approvalStatus:current.approvalStatus||{$exists:false}};
+      const patch={approvalStatus:next,status:decision==='APPROVE'?'ACTIVE':'REJECTED',reviewReason:decision==='REJECT'?reason:'',reviewedAt:now,reviewedBy:req.admin._id,updatedAt:now};
+      const update=await db.collection('merchants').updateOne(filter,{$set:patch});
+      if(!update.matchedCount)return res.status(409).json({message:'Hồ sơ đã được người khác xử lý. Vui lòng tải lại.'});
+      try{await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:decision==='APPROVE'?'MERCHANT_APPROVED':'MERCHANT_REJECTED',entityType:'MERCHANT',entityId:String(id),before:{approvalStatus:reviewStatus(current),status:current.status},after:patch,createdAt:now});}
+      catch(error){console.error('[MERCHANT REVIEW AUDIT]',error.message);}
+      const merchant=await db.collection('merchants').findOne({_id:id});
+      return res.json({merchant:adminMerchantRecord(merchant)});
+    }catch(e){console.error('[MERCHANT REVIEW]',e);return res.status(500).json({message:'Không xử lý được hồ sơ.'});}
+  });
+  r.put('/merchants/:id',permit('merchants.manage'),async(req,res)=>{try{const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});const patch={};for(const k of ['name','commissionRate','categoryCode','merchantType','merchantTypeLabel','categoryName','logoUrl','coverUrl'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];if(req.body?.status!==undefined){const status=String(req.body.status).toUpperCase();if(!['ACTIVE','BUSY','PAUSED','SUSPENDED'].includes(status))return res.status(400).json({message:'Trạng thái hoạt động không hợp lệ.'});const current=await getDb().collection('merchants').findOne({_id});if(!current)return res.status(404).json({message:'Không tìm thấy cửa hàng.'});if(reviewStatus(current)!=='APPROVED')return res.status(409).json({message:'Phải duyệt hồ sơ trước khi đổi trạng thái hoạt động.'});patch.status=status;}patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id},{$set:patch});await getDb().collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'MERCHANT_UPDATE',entityType:'MERCHANT',entityId:String(_id),after:patch,createdAt:new Date()});res.json({merchant:adminMerchantRecord(await getDb().collection('merchants').findOne({_id}))});}catch(e){res.status(400).json({message:e.message});}});
   r.get('/orders',permit('orders.view'),async(req,res)=>{
     try{
       const q={serviceCode:{$in:COMMERCE_SERVICE_CODES}};

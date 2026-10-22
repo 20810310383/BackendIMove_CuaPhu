@@ -19,13 +19,13 @@ const ADMIN_ALL_PERMISSIONS = [
   'support.view','support.assign','support.reply','support.close',
   'settings.view','settings.manage','reports.view','audit.view',
   'admins.view','admins.manage','roles.manage',
-  'services.view','services.manage','merchants.view','merchants.manage','orders.view','orders.dispatch','orders.policy.manage',
+  'services.view','services.manage','merchants.view','merchants.manage','merchants.approve','orders.view','orders.dispatch','orders.policy.manage',
   'pricing.manage','broadcast.manage'
 ];
 
 const DEFAULT_ADMIN_ROLES = [
   ['SUPER_ADMIN','Quản trị tối cao',ADMIN_ALL_PERMISSIONS],
-  ['OPERATIONS','Vận hành',['dashboard.view','users.view','users.update','drivers.view','drivers.review','drivers.approve','vehicles.view','vehicles.review','bookings.view','bookings.adjust','bookings.cancel','matching.view','matching.manage','matching.dispatch','trust.view','trust.review','trust.manage','broadcast.view','broadcast.send','broadcast.manage','reports.view','services.view','merchants.view','orders.view','orders.dispatch']],
+  ['OPERATIONS','Vận hành',['dashboard.view','users.view','users.update','drivers.view','drivers.review','drivers.approve','vehicles.view','vehicles.review','bookings.view','bookings.adjust','bookings.cancel','matching.view','matching.manage','matching.dispatch','trust.view','trust.review','trust.manage','broadcast.view','broadcast.send','broadcast.manage','reports.view','services.view','merchants.view','merchants.approve','orders.view','orders.dispatch']],
   ['DRIVER_REVIEW','Duyệt tài xế',['dashboard.view','drivers.view','drivers.review','drivers.approve','drivers.suspend','vehicles.view','vehicles.review']],
   ['PRICING_MANAGER','Quản lý giá cước',['dashboard.view','pricing.view','pricing.create','pricing.activate','pricing.archive','fees.view','fees.manage','promotions.view','promotions.manage','audit.view','pricing.manage','services.view','services.manage','orders.policy.manage']],
   ['FINANCE','Kế toán - tài chính',['dashboard.view','bookings.view','payments.view','payments.refund','wallets.view','wallets.adjust','settlements.view','settlements.manage','reports.view']],
@@ -212,7 +212,7 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     }
     await roles.updateOne(
       {code:'OPERATIONS'},
-      {$addToSet:{permissions:{$each:['matching.view','matching.manage','matching.dispatch','trust.view','trust.review','broadcast.manage','services.view','merchants.view','orders.view','orders.dispatch']}},$set:{updatedAt:new Date()}},
+      {$addToSet:{permissions:{$each:['matching.view','matching.manage','matching.dispatch','trust.view','trust.review','broadcast.manage','services.view','merchants.view','merchants.approve','orders.view','orders.dispatch']}},$set:{updatedAt:new Date()}},
     ).catch(()=>{});
     await roles.updateOne(
       {code:'PRICING_MANAGER'},

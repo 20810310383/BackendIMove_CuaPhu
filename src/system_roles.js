@@ -1,8 +1,8 @@
 const SYSTEM_ROLES={
  SUPER_ADMIN:{name:'Super Admin',permissions:['*']},
- OPERATIONS:{name:'Vận hành',permissions:['dashboard.view','bookings.view','drivers.view','users.view','matching.view','trust.view','trust.review','services.view','pricing.view','promotions.view','reports.view','payments.view','broadcast.view','settlement.view','merchants.view','merchants.manage','orders.view','orders.dispatch']},
+ OPERATIONS:{name:'Vận hành',permissions:['dashboard.view','bookings.view','drivers.view','users.view','matching.view','trust.view','trust.review','services.view','pricing.view','promotions.view','reports.view','payments.view','broadcast.view','settlement.view','merchants.view','merchants.manage','merchants.approve','orders.view','orders.dispatch']},
  FINANCE:{name:'Tài chính',permissions:['dashboard.view','reports.view','payments.view','payments.manage','settlement.view','settlement.manage','pricing.view','merchants.view','orders.view']},
- PRICING:{name:'Giá & Thương mại',permissions:['services.view','services.manage','pricing.view','pricing.manage','promotions.view','promotions.manage','reports.view','merchants.view','merchants.manage','orders.view','orders.policy.manage']},
+ PRICING:{name:'Giá & Thương mại',permissions:['services.view','services.manage','pricing.view','pricing.manage','promotions.view','promotions.manage','reports.view','merchants.view','merchants.manage','merchants.approve','orders.view','orders.policy.manage']},
  SUPPORT:{name:'Hỗ trợ',permissions:['dashboard.view','users.view','drivers.view','bookings.view','broadcast.view','trust.view','merchants.view','orders.view']},
 };
 function mergePermissions(current=[],required=[]){return [...new Set([...(current||[]),...(required||[])])];}

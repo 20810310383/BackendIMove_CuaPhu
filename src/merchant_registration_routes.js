@@ -148,6 +148,7 @@ function createMerchantRegistrationRouter({ getDb }) {
       try {
         const merchantDoc = {
           name: merchantName,
+          ownerName,
           merchantType,
           merchantTypeLabel: merchantType === 'RESTAURANT' ? 'Nhà hàng · Food' : 'Cửa hàng · Đặt hộ',
           categoryCode: merchantType === 'RESTAURANT' ? 'FOOD' : 'ERRAND',
@@ -156,6 +157,8 @@ function createMerchantRegistrationRouter({ getDb }) {
           address,
           description: '',
           status: 'PENDING',
+          approvalStatus: 'PENDING',
+          reviewDocuments: {},
           commissionRate: 0,
           logoUrl: null,
           coverUrl: null,

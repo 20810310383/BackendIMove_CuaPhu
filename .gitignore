@@ -4,3 +4,6 @@ reports/
 storage/kyc/
 .DS_Store
 Thumbs.db
+
+# Store private merchant verification documents outside public web paths.
+storage/private/
