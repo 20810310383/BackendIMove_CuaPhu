@@ -534,6 +534,21 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
         createdAt:now,updatedAt:now,
       };
       const result = await db.collection('orders').insertOne(doc); doc._id=result.insertedId;
+      if(merchantId && getNotifications){
+        const merchantUsers = await db.collection('merchant_users').find({merchantId,status:'ACTIVE'}).toArray().catch(()=>[]);
+        for (const member of merchantUsers) {
+          if (!member?.userId) continue;
+          await getNotifications().enqueue({
+            dedupeKey:`ORDER:${String(doc._id)}:MERCHANT_NEW:${String(member.userId)}`,
+            type:'MERCHANT_ORDER_NEW',
+            targetType:'MERCHANT',
+            targetId:member.userId,
+            title:'Đơn hàng mới',
+            body:`Bạn có đơn ${doc.orderCode || ''} đang chờ xác nhận.`,
+            data:{orderId:String(doc._id),status:doc.status,serviceCode:doc.serviceCode,orderCode:doc.orderCode||''},
+          }).catch(()=>{});
+        }
+      }
       // DELIVERY does not wait for merchant approval: dispatch automatically as soon as the order exists.
       if(!merchantId && ['DELIVERY','ERRAND'].includes(serviceCode)){
         setImmediate(()=>dispatchCommerceReady({db,order:doc,notificationService:getNotifications?getNotifications():null,actorType:'SYSTEM'}).catch((error)=>console.error('[COMMERCE AUTO DISPATCH]',error.message)));
@@ -561,10 +576,62 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
 function createMerchantRouter({ getDb, getNotifications }) {
   const r = express.Router();
   r.use(...createRequireMerchant(getDb));
+  async function notifyMerchantMembers({ merchantId, title, body, data = {}, type = 'MERCHANT_ALERT', dedupeKeyPrefix = 'MERCHANT_ALERT' }) {
+    if (!getNotifications || !merchantId) return;
+    const rows = await getDb().collection('merchant_users').find({ merchantId, status: 'ACTIVE' }).toArray().catch(() => []);
+    for (const row of rows) {
+      if (!row?.userId) continue;
+      await getNotifications().enqueue({
+        dedupeKey: `${dedupeKeyPrefix}:${String(merchantId)}:${String(row.userId)}`,
+        type,
+        targetType: 'MERCHANT',
+        targetId: row.userId,
+        title,
+        body,
+        data,
+      }).catch(() => {});
+    }
+  }
   r.get('/me', (req,res)=>res.json({user:serialize(req.auth.user),membership:serialize(req.merchantContext.membership),merchant:serialize(req.merchantContext.merchant)}));
+  r.get('/notifications', async (req,res)=>{
+    try {
+      const limit = Math.max(1, Math.min(100, Number(req.query.limit || 30) || 30));
+      const rows = await getDb().collection('notifications').find({ userId: req.auth.user._id, targetType: 'MERCHANT' }).sort({ createdAt: -1 }).limit(limit).toArray();
+      return res.json({ notifications: rows.map(serialize) });
+    } catch (e) {
+      return res.status(500).json({ message: e.message });
+    }
+  });
+  r.post('/notifications/:id/read', async (req,res)=>{
+    try {
+      const id = oid(req.params.id); if(!id) return res.status(400).json({ message:'Notification ID không hợp lệ.' });
+      const now = new Date();
+      await getDb().collection('notifications').updateOne({ _id:id, userId:req.auth.user._id, targetType:'MERCHANT' }, { $set:{ readAt: now, updatedAt: now } });
+      return res.json({ ok:true });
+    } catch (e) {
+      return res.status(400).json({ message:e.message });
+    }
+  });
+  r.post('/devices/register', async (req,res)=>{
+    try {
+      if(!getNotifications) return res.status(503).json({ message:'Notification service chưa sẵn sàng.' });
+      return res.json(await getNotifications().registerDevice({ ...req.body, userId:req.auth.user._id, userType:'MERCHANT' }));
+    } catch (e) {
+      return res.status(400).json({ message:e.message });
+    }
+  });
+  r.post('/devices/disable', async (req,res)=>{
+    try {
+      if(!req.body?.token && !req.body?.deviceId)return res.status(400).json({ message:'Thiếu token hoặc deviceId.' });
+      if(!getNotifications) return res.status(503).json({ message:'Notification service chưa sẵn sàng.' });
+      return res.json(await getNotifications().disableDevice({ userId:req.auth.user._id, token:req.body?.token, deviceId:req.body?.deviceId }));
+    } catch (e) {
+      return res.status(400).json({ message:e.message });
+    }
+  });
   // Merchants pending approval may edit their identity and upload evidence, but may not trade.
   r.use((req,res,next)=>{
-    if (/^\/(?:me|store|verification)(?:\/|$)/.test(req.path)) return next();
+    if (/^\/(?:me|store|verification|notifications|devices)(?:\/|$)/.test(req.path)) return next();
     if (reviewStatus(req.merchantContext.merchant)!=='APPROVED')
       return res.status(403).json({code:'MERCHANT_NOT_APPROVED',message:'Hồ sơ cửa hàng chưa được Admin duyệt.'});
     return next();
@@ -803,6 +870,21 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
       try{await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:decision==='APPROVE'?'MERCHANT_APPROVED':'MERCHANT_REJECTED',entityType:'MERCHANT',entityId:String(id),before:{approvalStatus:reviewStatus(current),status:current.status},after:patch,createdAt:now});}
       catch(error){console.error('[MERCHANT REVIEW AUDIT]',error.message);}
       const merchant=await db.collection('merchants').findOne({_id:id});
+      if(getNotifications){
+        const merchantUsers = await db.collection('merchant_users').find({ merchantId:id, status:'ACTIVE' }).toArray().catch(() => []);
+        for (const row of merchantUsers) {
+          if (!row?.userId) continue;
+          await getNotifications().enqueue({
+            dedupeKey: `${decision==='APPROVE' ? 'MERCHANT_APPROVED' : 'MERCHANT_REJECTED'}:${String(id)}:${now.getTime()}:${String(row.userId)}`,
+            type: decision==='APPROVE' ? 'MERCHANT_APPROVED' : 'MERCHANT_REJECTED',
+            targetType: 'MERCHANT',
+            targetId: row.userId,
+            title: decision==='APPROVE' ? 'Hồ sơ cửa hàng đã được duyệt' : 'Hồ sơ cửa hàng bị từ chối',
+            body: decision==='APPROVE' ? 'Cửa hàng của bạn đã được Admin phê duyệt và có thể nhận đơn.' : `Admin đã từ chối hồ sơ. ${reason || 'Hãy cập nhật lại giấy tờ và gửi lại.'}`,
+            data:{ merchantId:String(id), approvalStatus:next, reviewReason:reason || '' },
+          }).catch(()=>{});
+        }
+      }
       return res.json({merchant:adminMerchantRecord(merchant)});
     }catch(e){console.error('[MERCHANT REVIEW]',e);return res.status(500).json({message:'Không xử lý được hồ sơ.'});}
   });
