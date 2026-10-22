@@ -1,16 +1,10 @@
 const express = require('express');
-const jwt = require('jsonwebtoken');
+const { createAdminGuard } = require('./admin_guard');
 const { ObjectId } = require('mongodb');
 
 function oid(value) {
   try { return value instanceof ObjectId ? value : new ObjectId(String(value)); }
   catch (_) { return null; }
-}
-
-function jwtSecret() {
-  const value = String(process.env.JWT_ACCESS_SECRET || '').trim();
-  if (value.length < 32) throw new Error('JWT_ACCESS_SECRET chưa cấu hình an toàn.');
-  return value;
 }
 
 function cleanText(value, max = 500) {
@@ -32,63 +26,15 @@ function parseIdentifiers(value) {
 function createBroadcastRouter({ getDb, getNotifications }) {
   const router = express.Router();
 
-  async function admin(req, res, next) {
-    try {
-      const header = String(req.headers.authorization || '');
-      if (!header.startsWith('Bearer ')) {
-        return res.status(401).json({ message: 'Thiếu token Admin.' });
-      }
-
-      const payload = jwt.verify(header.slice(7), jwtSecret());
-      const id = oid(payload.sub || payload.userId);
-      const user = id
-        ? await getDb().collection('users').findOne({ _id: id, roles: 'ADMIN' })
-        : null;
-
-      if (!user) return res.status(403).json({ message: 'Không có quyền ADMIN.' });
-
-      req.admin = user;
-
-      const codes = Array.isArray(user.adminRoleCodes)
-        ? user.adminRoleCodes
-        : Array.isArray(user.roleCodes)
-            ? user.roleCodes
-            : [];
-
-      if (!codes.length || codes.includes('SUPER_ADMIN')) {
-        req.adminPermissions = ['*'];
-      } else {
-        const roles = await getDb().collection('admin_roles')
-          .find({ code: { $in: codes }, status: 'ACTIVE' })
-          .toArray();
-        req.adminPermissions = [
-          ...new Set(
-            roles.flatMap((item) =>
-              Array.isArray(item.permissions) ? item.permissions : [],
-            ),
-          ),
-        ];
-      }
-
-      return next();
-    } catch (_) {
-      return res.status(401).json({ message: 'Phiên Admin không hợp lệ.' });
-    }
-  }
-
-  const permit = (permission) => (req, res, next) => {
-    if (
-      req.adminPermissions.includes('*') ||
-      req.adminPermissions.includes(permission)
-    ) {
-      return next();
-    }
-    return res.status(403).json({
-      message: `Bạn không có quyền ${permission}.`,
-    });
+  // Use the common admin guard: accounts without assigned roles must not
+  // inherit SUPER_ADMIN rights when broadcasting to all users.
+  const { requireAdmin, permit } = createAdminGuard({ getDb });
+  router.use(requireAdmin);
+  const permitSend = (req, res, next) => {
+    const permissions = req.adminPermissions || [];
+    if (permissions.includes('*') || permissions.includes('broadcast.send') || permissions.includes('broadcast.manage')) return next();
+    return res.status(403).json({ message: 'Thiếu quyền broadcast.send.' });
   };
-
-  router.use(admin);
 
   async function resolveCustomers(identifiers = null) {
     const db = getDb();
@@ -212,6 +158,78 @@ function createBroadcastRouter({ getDb, getNotifications }) {
     return [...unique.values()];
   }
 
+  function parseRequest(req) {
+    const title = cleanText(req.body?.title, 120);
+    const body = cleanText(req.body?.body, 1500);
+    const level = Number(req.body?.level ?? 4);
+    const audience = String(req.body?.audience || 'BOTH').toUpperCase();
+    const specificType = String(req.body?.specificType || 'BOTH').toUpperCase();
+    const identifiers = parseIdentifiers(req.body?.identifiers);
+    const expiryHours = Number(req.body?.expiryHours || 24);
+    const deliveryMode = String(req.body?.deliveryMode || 'PUSH_AND_IN_APP').toUpperCase();
+    if (title.length < 2 || body.length < 2) throw Object.assign(new Error('Tiêu đề và nội dung phải có tối thiểu 2 ký tự.'), { httpStatus: 400 });
+    if (!Number.isInteger(level) || level < 1 || level > 4) throw Object.assign(new Error('Cấp thông báo không hợp lệ.'), { httpStatus: 400 });
+    if (!['CUSTOMERS','DRIVERS','BOTH','ONLINE_DRIVERS','SPECIFIC'].includes(audience)) throw Object.assign(new Error('Nhóm nhận không hợp lệ.'), { httpStatus: 400 });
+    if (audience === 'SPECIFIC' && (!identifiers.length || !['CUSTOMER','DRIVER','BOTH'].includes(specificType))) throw Object.assign(new Error('Cần cung cấp người nhận cụ thể và loại tài khoản.'), { httpStatus: 400 });
+    if (!Number.isInteger(expiryHours) || expiryHours < 1 || expiryHours > 168) throw Object.assign(new Error('Thời gian hiệu lực không hợp lệ.'), { httpStatus: 400 });
+    if (!['PUSH_AND_IN_APP','IN_APP_ONLY'].includes(deliveryMode)) throw Object.assign(new Error('Kênh thông báo không hợp lệ.'), { httpStatus: 400 });
+    return { title, body, level, audience, specificType, identifiers, expiryHours, deliveryMode };
+  }
+
+  async function pushCoverage(recipients) {
+    const active = new Set();
+    const db = getDb();
+    // Chunk $in queries to keep large broadcasts within MongoDB limits.
+    for (const targetType of ['CUSTOMER', 'DRIVER']) {
+      const ids = recipients.filter(x => x.targetType === targetType).map(x => x.targetId);
+      for (let start = 0; start < ids.length; start += 400) {
+        const rows = await db.collection('device_tokens').find({
+          userType: targetType,
+          userId: { $in: ids.slice(start, start + 400) },
+          enabled: true,
+        }).project({ userId: 1 }).toArray();
+        for (const row of rows) active.add(`${targetType}:${String(row.userId)}`);
+      }
+    }
+    return active.size;
+  }
+
+  async function prepare(req) {
+    const input = parseRequest(req);
+    const recipients = await resolveRecipients(input);
+    if (!recipients.length) throw Object.assign(new Error('Không tìm thấy tài khoản nhận thông báo.'), { httpStatus: 400 });
+    const fcmConfigured = Boolean(getNotifications()?.isConfigured?.());
+    const pushEligible = input.deliveryMode === 'IN_APP_ONLY' ? 0 : await pushCoverage(recipients);
+    return { input, recipients, fcmConfigured, pushEligible };
+  }
+
+  router.get('/push-status', permit('broadcast.view'), async (_req, res) => {
+    try {
+      const db = getDb();
+      const [customerTokens, driverTokens] = await Promise.all([
+        db.collection('device_tokens').countDocuments({ userType:'CUSTOMER', enabled:true }),
+        db.collection('device_tokens').countDocuments({ userType:'DRIVER', enabled:true }),
+      ]);
+      return res.json({
+        fcmConfigured: Boolean(getNotifications()?.isConfigured?.()),
+        activeTokens: { customers: customerTokens, drivers: driverTokens },
+        note: 'Số token đang bật không phải số thiết bị đã nhận push thành công.',
+      });
+    } catch (error) { return res.status(503).json({ message: error.message }); }
+  });
+
+  router.post('/preview', permitSend, async (req, res) => {
+    try {
+      const { input, recipients, fcmConfigured, pushEligible } = await prepare(req);
+      return res.json({
+        audience: input.audience, deliveryMode: input.deliveryMode,
+        totalTargets: recipients.length, fcmConfigured, pushEligible,
+        withoutPushToken: input.deliveryMode === 'IN_APP_ONLY' ? null : recipients.length - pushEligible,
+        canSubmit: input.deliveryMode === 'IN_APP_ONLY' || (fcmConfigured && pushEligible > 0),
+      });
+    } catch (error) { return res.status(error.httpStatus || 503).json({ message: error.message }); }
+  });
+
   async function broadcastStats(broadcastId) {
     const db = getDb();
     const id = oid(broadcastId);
@@ -259,6 +277,7 @@ function createBroadcastRouter({ getDb, getNotifications }) {
     return {
       total: Number(n.total || 0),
       sent: Number(byStatus.SENT || 0) + Number(byStatus.IN_APP || 0),
+      fcmSent: Number(byStatus.SENT || 0),
       inApp: Number(byStatus.IN_APP || 0),
       failed: Number(byStatus.FAILED || 0),
       noDevice: Number(byStatus.NO_DEVICE || 0),
@@ -333,51 +352,15 @@ function createBroadcastRouter({ getDb, getNotifications }) {
     }
   });
 
-  router.post('/', permit('broadcast.send'), async (req, res) => {
+  router.post('/', permitSend, async (req, res) => {
     try {
-      const title = cleanText(req.body?.title, 120);
-      const body = cleanText(req.body?.body, 1500);
-      const level = Math.min(4, Math.max(1, Math.round(Number(req.body?.level) || 4)));
-      const audience = String(req.body?.audience || 'CUSTOMERS').toUpperCase();
-      const specificType = String(req.body?.specificType || 'CUSTOMER').toUpperCase();
-      const identifiers = parseIdentifiers(req.body?.identifiers);
-      const expiryHours = Math.max(
-        1,
-        Math.min(
-          168,
-          Number(req.body?.expiryHours) || (level === 1 ? 24 : level === 2 ? 48 : 72),
-        ),
-      );
-
-      const allowedAudiences = new Set([
-        'CUSTOMERS',
-        'DRIVERS',
-        'BOTH',
-        'ONLINE_DRIVERS',
-        'SPECIFIC',
-      ]);
-
-      if (!title) return res.status(400).json({ message: 'Vui lòng nhập tiêu đề.' });
-      if (!body) return res.status(400).json({ message: 'Vui lòng nhập nội dung.' });
-      if (!allowedAudiences.has(audience)) {
-        return res.status(400).json({ message: 'Nhóm nhận thông báo không hợp lệ.' });
+      const { input, recipients, fcmConfigured, pushEligible } = await prepare(req);
+      const { title, body, level, audience, specificType, identifiers, expiryHours, deliveryMode } = input;
+      if (deliveryMode === 'PUSH_AND_IN_APP' && !fcmConfigured) {
+        return res.status(409).json({ code: 'FCM_NOT_CONFIGURED', message: 'FCM chưa được cấu hình trên Backend. Hãy bật FCM hoặc chọn Chỉ trong ứng dụng.' });
       }
-      if (audience === 'SPECIFIC' && !identifiers.length) {
-        return res.status(400).json({
-          message: 'Vui lòng nhập SĐT, email hoặc ID người nhận.',
-        });
-      }
-
-      const recipients = await resolveRecipients({
-        audience,
-        specificType,
-        identifiers,
-      });
-
-      if (!recipients.length) {
-        return res.status(400).json({
-          message: 'Không tìm thấy người nhận phù hợp.',
-        });
+      if (deliveryMode === 'PUSH_AND_IN_APP' && pushEligible === 0) {
+        return res.status(409).json({ code: 'NO_PUSH_TOKENS', message: 'Không có thiết bị User/Driver nào đăng ký token push hợp lệ cho nhóm nhận.' });
       }
 
       const now = new Date();
@@ -392,9 +375,11 @@ function createBroadcastRouter({ getDb, getNotifications }) {
         specificType: audience === 'SPECIFIC' ? specificType : null,
         identifiers: audience === 'SPECIFIC' ? identifiers : [],
         expiryHours,
+        deliveryMode,
+        pushEligible,
         expiresAt,
         totalTargets: recipients.length,
-        status: 'SENDING',
+        status: 'QUEUED',
         createdBy: req.admin._id,
         createdAt: now,
         updatedAt: now,
@@ -427,6 +412,7 @@ function createBroadcastRouter({ getDb, getNotifications }) {
               requireAck: level === 1,
               expiresAt,
               source: 'ADMIN',
+              deliveryMode,
               data: {
                 type: 'ADMIN_BROADCAST',
                 source: 'ADMIN',
@@ -443,8 +429,8 @@ function createBroadcastRouter({ getDb, getNotifications }) {
         { _id: broadcastId },
         {
           $set: {
-            status: 'SENT',
-            sentAt: new Date(),
+            status: 'QUEUED',
+            queuedAt: new Date(),
             updatedAt: new Date(),
           },
         },
@@ -454,15 +440,18 @@ function createBroadcastRouter({ getDb, getNotifications }) {
         ok: true,
         id: String(broadcastId),
         totalTargets: recipients.length,
+        pushEligible,
+        deliveryMode,
+        status: 'QUEUED',
         level,
         requireAck: level === 1,
       });
     } catch (error) {
-      return res.status(500).json({ message: error.message });
+      return res.status(error.httpStatus || 500).json({ message: error.message });
     }
   });
 
-  router.delete('/:id', permit('broadcast.send'), async (req, res) => {
+  router.delete('/:id', permitSend, async (req, res) => {
     try {
       const id = oid(req.params.id);
       if (!id) return res.status(400).json({ message: 'Broadcast id không hợp lệ.' });

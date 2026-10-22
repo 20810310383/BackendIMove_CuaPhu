@@ -179,6 +179,7 @@ function createNotificationService({ getDb }) {
     requireAck = false,
     expiresAt = null,
     source = null,
+    deliveryMode = 'PUSH_AND_IN_APP',
   }) {
     const db = getDb();
     const now = new Date();
@@ -211,6 +212,7 @@ function createNotificationService({ getDb }) {
       requireAck: effectiveRequireAck,
       expiresAt: normalizedExpiresAt,
       source: source || null,
+      deliveryMode: String(deliveryMode || 'PUSH_AND_IN_APP').toUpperCase(),
       title: String(title || 'TH79 iMove'),
       body: String(body || ''),
       data: Object.fromEntries(
@@ -314,7 +316,7 @@ function createNotificationService({ getDb }) {
     // MongoDB is the source of truth for notifications in iMove 1.6.0.
     // FCM is only an optional wake-up channel. A missing token or missing
     // Firebase credentials must never make an in-app notification fail.
-    if (!tokens.length || !messaging) {
+    if (outbox.deliveryMode === 'IN_APP_ONLY' || !tokens.length || !messaging) {
       const now = new Date();
       await db.collection('notification_outbox').updateOne(
         { _id: outbox._id },
@@ -323,7 +325,7 @@ function createNotificationService({ getDb }) {
             status: 'IN_APP',
             attempts: attempt,
             sentAt: now,
-            lastError: !tokens.length ? 'IN_APP_ONLY_NO_DEVICE_TOKEN' : 'IN_APP_ONLY_FCM_DISABLED',
+            lastError: outbox.deliveryMode === 'IN_APP_ONLY' ? 'DELIVERY_MODE_IN_APP_ONLY' : (!tokens.length ? 'IN_APP_ONLY_NO_DEVICE_TOKEN' : 'IN_APP_ONLY_FCM_DISABLED'),
             updatedAt: now,
           },
         },
