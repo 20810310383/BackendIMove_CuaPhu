@@ -140,6 +140,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     const db = getDb(); const bookingId = oid(rawBookingId); if (!bookingId) throw new Error('Booking id không hợp lệ.');
     let booking = await db.collection('bookings').findOne({ _id: bookingId });
     if (!booking) throw new Error('Không tìm thấy booking.');
+    if (booking.adminArchivedAt) return { skipped: true, reason: 'BOOKING_ADMIN_ARCHIVED' };
     if (booking.status === 'NO_DRIVER' && (reset || adminId)) {
       await db.collection('bookings').updateOne(
         { _id: bookingId, status: 'NO_DRIVER' },
@@ -417,6 +418,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     const strandedBefore = new Date(now.getTime() - 15000);
     const bookings = await db.collection('bookings').find({
       status: 'SEARCHING',
+      adminArchivedAt: { $exists: false },
       $or: [
         { dispatchEngine: { $exists: false }, createdAt: { $lte: strandedBefore } },
         { 'dispatchEngine.status': { $in: ['QUEUED', 'NEXT_ROUND', 'REQUEUED', 'ADMIN_REQUEUED'] }, updatedAt: { $lte: strandedBefore } },
@@ -457,6 +459,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     const now = new Date();
     const retryBookings = await db.collection('bookings').find({
       status: { $in: ['SEARCHING', 'OFFERED'] },
+      adminArchivedAt: { $exists: false },
       'dispatchEngine.status': 'RETRY_WAIT',
       'dispatchEngine.nextRetryAt': { $lte: now },
     }).limit(25).toArray();
@@ -495,7 +498,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
 
   async function manualOffer(rawBookingId, rawDriverId, adminId = null) {
     const bookingId = oid(rawBookingId), driverId = oid(rawDriverId); if (!bookingId || !driverId) throw new Error('ID không hợp lệ.');
-    let booking = await getDb().collection('bookings').findOne({ _id: bookingId }); if (!booking || !['SEARCHING', 'OFFERED', 'NO_DRIVER'].includes(booking.status)) throw new Error('Chuyến không còn ở trạng thái có thể điều phối.');
+    let booking = await getDb().collection('bookings').findOne({ _id: bookingId }); if (!booking || booking.adminArchivedAt || !['SEARCHING', 'OFFERED', 'NO_DRIVER'].includes(booking.status)) throw new Error('Chuyến không còn ở trạng thái có thể điều phối.');
     if (booking.status === 'NO_DRIVER') {
       await getDb().collection('bookings').updateOne({ _id: bookingId, status: 'NO_DRIVER' }, { $set: { status: 'SEARCHING', updatedAt: new Date(), 'dispatchEngine.status': 'ADMIN_REQUEUED' }, $unset: { 'dispatchEngine.completedAt': '' } });
       booking = await getDb().collection('bookings').findOne({ _id: bookingId });

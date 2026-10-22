@@ -2,6 +2,7 @@ const express = require('express');
 const jwt = require('jsonwebtoken');
 const { ObjectId } = require('mongodb');
 const { mergeDriversWithLocations } = require('./driver_location_service');
+const { createAdminGuard } = require('./admin_guard');
 
 function jwtSecret() {
   const secret = String(process.env.JWT_ACCESS_SECRET || '').trim();
@@ -42,7 +43,8 @@ function createAdminOpsRouter({ getDb }) {
     }
   }
 
-  router.use(requireAdmin);
+  const { requireAdmin: requireAdminWithPermissions, permit } = createAdminGuard({getDb});
+  router.use(requireAdminWithPermissions);
 
   router.get('/overview', async (req, res) => {
     try {
@@ -79,6 +81,8 @@ function createAdminOpsRouter({ getDb }) {
       const status = String(req.query.status || '').trim().toUpperCase();
       const q = String(req.query.q || '').trim();
       const filter = {};
+      if (String(req.query.archived || '') === 'true') filter.adminArchivedAt = { $exists: true };
+      else filter.adminArchivedAt = { $exists: false };
       if (status && status !== 'ALL') filter.status = status;
       if (q) filter.$or = [{ bookingCode: { $regex: q, $options: 'i' } }, { 'pickup.address': { $regex: q, $options: 'i' } }, { 'destination.address': { $regex: q, $options: 'i' } }];
       const rows = await db.collection('bookings').find(filter).sort({ createdAt: -1 }).limit(limit).toArray();
@@ -89,6 +93,8 @@ function createAdminOpsRouter({ getDb }) {
         customerTotal: Math.round(number(x.pricing?.customerTotal || x.pricing?.total)),
         driverNetAmount: Math.round(number(x.pricing?.driverNetAmount)), platformCommission: Math.round(number(x.pricing?.platformCommission)),
         paymentStatus: x.paymentStatus || null, paymentMethod: x.paymentMethod || null,
+        serviceCode: x.serviceCode || x.serviceType || x.vehicleType || x.vehicleCategory || x.bookingType || null,
+        archiveReason: x.adminArchiveReason || null, adminArchivedAt: iso(x.adminArchivedAt),
         createdAt: iso(x.createdAt), completedAt: iso(x.completedAt), updatedAt: iso(x.updatedAt),
       })));
     } catch (error) { return res.status(500).json({ message: error.message }); }
@@ -118,6 +124,55 @@ function createAdminOpsRouter({ getDb }) {
         financials: walletTx.map((t) => ({ id: String(t._id), type: t.type, title: t.title, amount: number(t.amount), status: t.status, createdAt: iso(t.createdAt) })),
       });
     } catch (error) { return res.status(500).json({ message: error.message }); }
+  });
+
+  // Administrative deletion means reversible list archival, never physical deletion of
+  // bookings, booking_events, financial journals or settlement evidence.
+  router.post('/bookings/:id/archive', permit('bookings.adjust'), async (req, res) => {
+    try {
+      const id = safeObjectId(req.params.id);
+      if (!id) return res.status(400).json({ message: 'Booking ID không hợp lệ.' });
+      const reason = String(req.body?.reason || '').trim().slice(0, 400);
+      if (reason.length < 10) return res.status(400).json({ message: 'Cần ghi lý do xử lý tối thiểu 10 ký tự.' });
+      const db = getDb();
+      const booking = await db.collection('bookings').findOne({ _id: id });
+      if (!booking) return res.status(404).json({ message: 'Không tìm thấy chuyến.' });
+      if (booking.adminArchivedAt) return res.status(409).json({ message: 'Chuyến đã được lưu trữ.' });
+      const status = String(booking.status || '').toUpperCase();
+      const terminal = new Set(['NO_DRIVER','EXPIRED','CANCELLED','CANCELLED_BY_USER','CANCELLED_BY_DRIVER','FAILED']);
+      if (!terminal.has(status)) return res.status(409).json({ code: 'TRIP_NOT_ARCHIVABLE', message: 'Chỉ lưu trữ chuyến lỗi/hủy/hết hạn. Chuyến đang chạy hoặc COMPLETED phải đối soát trước.' });
+      if (booking.driverId || booking.assignedAt || booking.startedAt || booking.completedAt || booking.settledAt) {
+        return res.status(409).json({ message: 'Chuyến từng có tài xế hoặc phát sinh thực hiện; cần đối soát thủ công, không thể ẩn nhanh.' });
+      }
+      const linkedCollections = ['wallet_transactions','loyalty_transactions','payments','settlements','revenue'];
+      for (const collection of linkedCollections) {
+        const found = await db.collection(collection).findOne({ $or: [{ bookingId: id }, { bookingId: String(id) }, { tripId: id }, { tripId: String(id) }, { bookingCode: booking.bookingCode || '__NO_BOOKING_CODE__' }] }, { projection: { _id: 1 } });
+        if (found) return res.status(409).json({ code: 'TRIP_HAS_FINANCIAL_RECORDS', message: 'Chuyến có phát sinh tài chính; không được xóa khỏi danh sách khi chưa đối soát.' });
+      }
+      const at = new Date();
+      const changed = await db.collection('bookings').updateOne(
+        { _id: id, status: booking.status, adminArchivedAt: { $exists: false }, driverId: { $in: [null] } },
+        { $set: { adminArchivedAt: at, adminArchivedBy: req.admin._id, adminArchiveReason: reason, updatedAt: at } },
+      );
+      if (!changed.modifiedCount) return res.status(409).json({ message: 'Trạng thái chuyến vừa thay đổi. Hãy tải lại.' });
+      await db.collection('audit_logs').insertOne({ actorType: 'ADMIN', actorId: req.admin._id, action: 'BOOKING_ADMIN_ARCHIVE', entityType: 'BOOKING', entityId: String(id), after: { status, reason }, createdAt: at }).catch(error=>console.error('[TRIP ARCHIVE AUDIT]', error));
+      return res.json({ ok: true, archivedAt: at.toISOString(), id: String(id) });
+    } catch (error) { return res.status(500).json({ message: 'Không thể lưu trữ chuyến. ' + error.message }); }
+  });
+
+  router.post('/bookings/:id/restore', permit('bookings.adjust'), async (req, res) => {
+    try {
+      const id = safeObjectId(req.params.id);
+      if (!id) return res.status(400).json({ message: 'Booking ID không hợp lệ.' });
+      const db = getDb();
+      const booking = await db.collection('bookings').findOne({ _id: id });
+      if (!booking) return res.status(404).json({ message: 'Không tìm thấy chuyến.' });
+      if (!booking.adminArchivedAt) return res.status(409).json({ message: 'Chuyến chưa được lưu trữ.' });
+      const changed = await db.collection('bookings').updateOne({ _id: id, adminArchivedAt: booking.adminArchivedAt }, { $unset: { adminArchivedAt: '', adminArchivedBy: '', adminArchiveReason: '' }, $set: { updatedAt: new Date() } });
+      if (!changed.modifiedCount) return res.status(409).json({ message: 'Dữ liệu đã thay đổi.' });
+      await db.collection('audit_logs').insertOne({ actorType: 'ADMIN', actorId: req.admin._id, action: 'BOOKING_ADMIN_RESTORE', entityType: 'BOOKING', entityId: String(id), createdAt: new Date() }).catch(error=>console.error('[TRIP RESTORE AUDIT]', error));
+      return res.json({ ok: true, id: String(id) });
+    } catch (error) { return res.status(500).json({ message: 'Không thể khôi phục chuyến. ' + error.message }); }
   });
 
   router.get('/drivers/live', async (req, res) => {

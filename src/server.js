@@ -485,12 +485,26 @@ app.post('/api/v69/driver/devices/register', requireApprovedDriver, async (req, 
   try {
     const found = await findDriverByPhone(req.auth.user.phone);
     if (!found) return res.status(404).json({ message: 'Không tìm thấy tài xế.' });
-    return res.json(await notificationService.registerDevice({ userId: found.driver._id, userType: 'DRIVER', ...req.body }));
+    return res.json(await notificationService.registerDevice({ ...req.body, userId: found.driver._id, userType: 'DRIVER' }));
   } catch (e) { return res.status(400).json({ message: e.message }); }
 });
 app.post('/api/v69/customer/devices/register', requireCustomer, async (req, res) => {
-  try { return res.json(await notificationService.registerDevice({ userId: req.auth.user._id, userType: 'CUSTOMER', ...req.body })); }
+  try { return res.json(await notificationService.registerDevice({ ...req.body, userId: req.auth.user._id, userType: 'CUSTOMER' })); }
   catch (e) { return res.status(400).json({ message: e.message }); }
+});
+app.post('/api/v69/driver/devices/disable', requireApprovedDriver, async (req,res) => {
+  try {
+    const found = await findDriverByPhone(req.auth.user.phone);
+    if(!found)return res.status(404).json({message:'Không tìm thấy tài xế.'});
+    if(!req.body?.token)return res.status(400).json({message:'Thiếu token thiết bị.'});
+    return res.json(await notificationService.disableDevice({userId: found.driver._id, token:req.body.token}));
+  } catch(e) { return res.status(400).json({message:e.message}); }
+});
+app.post('/api/v69/customer/devices/disable', requireCustomer, async (req,res) => {
+  try {
+    if(!req.body?.token)return res.status(400).json({message:'Thiếu token thiết bị.'});
+    return res.json(await notificationService.disableDevice({userId:req.auth.user._id,token:req.body.token}));
+  } catch(e) { return res.status(400).json({message:e.message}); }
 });
 app.delete('/api/v69/driver/devices/current', requireApprovedDriver, async (req, res) => {
   const found = await findDriverByPhone(req.auth.user.phone); if (!found) return res.status(404).json({message:'Không tìm thấy tài xế.'});
