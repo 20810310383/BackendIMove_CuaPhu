@@ -197,10 +197,11 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     if (!candidates.length) {
       const delaySeconds = Math.max(2, Math.min(10, Number(cfg.retry?.retryDelaySeconds?.[0] || 3)));
       const nextRetryAt = new Date(Date.now() + delaySeconds * 1000);
-      await db.collection('bookings').updateOne(
-        { _id: bookingId },
+      const pendingChange = await db.collection('bookings').updateOne(
+        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
         { $set: { status: 'SEARCHING', 'dispatchEngine.version': dispatchVersion, 'dispatchEngine.currentRound': nextRound, 'dispatchEngine.status': 'WAITING_NEXT_ROUND', 'dispatchEngine.nextRetryAt': nextRetryAt, updatedAt: new Date() } },
       );
+      if (!pendingChange.modifiedCount) return { skipped: true, reason: 'BOOKING_STATE_CHANGED' };
       await event(bookingId, 'ROUND_EMPTY', { round: nextRound, dispatchVersion, candidatePreviewCount: Number(preview?.candidates?.length || 0), nextRetryAt });
       scheduleRetry(bookingId, delaySeconds, { reset: false, adminId });
       return { waitingNextRound: true, round: nextRound, nextRetryAt };
@@ -217,10 +218,25 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       } catch (e) { if (e.code !== 11000) throw e; offer = await db.collection('booking_offers_v69').findOne({ bookingId, driverId, dispatchVersion }); }
       if (!offer) continue;
       const payload = serializeBooking(booking);
-      getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: payload, round: nextRound, matchingScore: c.score });
-      await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.socketSent': true, updatedAt: new Date() } });
-      await notificationService.enqueue({ dedupeKey: `BOOKING_OFFER:${bookingId}:${driverId}:${dispatchVersion}`, type: 'BOOKING_OFFER', targetType: 'DRIVER', targetId: driverId, bookingId, offerId: offer._id, title: 'Có chuyến mới', body: c.distanceKm == null ? 'Có khách đang chờ bạn nhận chuyến.' : `Điểm đón cách bạn ${Number(c.distanceKm).toFixed(1)} km`, data: { bookingId, offerId: offer._id, dispatchVersion, expiresAt } });
-      await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.fcmQueued': true } });
+      // An unavailable socket/push service must never abort the entire dispatch
+      // round after an offer has already been persisted in MongoDB. The Driver
+      // app also polls /api/v69/driver/offers/active as a delivery fallback.
+      try {
+        getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: payload, round: nextRound, matchingScore: c.score });
+        await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.socketSent': true, updatedAt: new Date() } });
+      } catch (e) {
+        console.error('[V6.9 Dispatch socket]', e.message);
+      }
+      try {
+        await notificationService.enqueue({ dedupeKey: `BOOKING_OFFER:${bookingId}:${driverId}:${dispatchVersion}`, type: 'BOOKING_OFFER', targetType: 'DRIVER', targetId: driverId, bookingId, offerId: offer._id, title: 'Có chuyến mới', body: c.distanceKm == null ? 'Có khách đang chờ bạn nhận chuyến.' : `Điểm đón cách bạn ${Number(c.distanceKm).toFixed(1)} km`, data: { bookingId, offerId: offer._id, dispatchVersion, expiresAt } });
+        await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.fcmQueued': true } });
+      } catch (e) {
+        console.error('[V6.9 Dispatch notification]', e.message);
+        await db.collection('booking_offers_v69').updateOne(
+          { _id: offer._id },
+          { $set: { 'notification.lastError': String(e.message).slice(0, 350), updatedAt: new Date() } },
+        ).catch(() => {});
+      }
     }
     await db.collection('bookings').updateOne({ _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } }, { $set: { status: 'OFFERED', dispatchEngine: { version: dispatchVersion, currentRound: nextRound, status: 'WAITING', roundExpiresAt: expiresAt, startedAt: booking.dispatchEngine?.startedAt || now, updatedAt: now }, updatedAt: now } });
     await event(bookingId, 'ROUND_STARTED', { round: nextRound, dispatchVersion, candidateCount: candidates.length, expiresAt, adminId });
@@ -232,10 +248,15 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     if (!bookingId) throw new Error('Booking id không hợp lệ.');
     try {
       const result = await dispatchBooking(bookingId, options);
-      await getDb().collection('bookings').updateOne(
-        { _id: bookingId },
-        { $unset: { 'dispatchEngine.retryCount': '', 'dispatchEngine.nextRetryAt': '', 'dispatchEngine.lastError': '' } },
-      ).catch(() => {});
+      // A round with no eligible drivers schedules its own durable retry.
+      // Do NOT erase nextRetryAt here: after a PM2/VPS restart the persisted
+      // timestamp is the only way the recovery sweeper can find this booking.
+      if (!result?.waitingNextRound && !result?.waitingDriver && !result?.skipped) {
+        await getDb().collection('bookings').updateOne(
+          { _id: bookingId, 'dispatchEngine.status': { $nin: ['WAITING_NEXT_ROUND', 'WAITING_DRIVER', 'RETRY_WAIT'] } },
+          { $unset: { 'dispatchEngine.retryCount': '', 'dispatchEngine.nextRetryAt': '', 'dispatchEngine.lastError': '' } },
+        ).catch(() => {});
+      }
       return result;
     } catch (error) {
       const cfg = await getConfig();
@@ -402,10 +423,10 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
         // RETRYING normally exists only for the few milliseconds between the
         // sweep claiming it and the async retry starting. Recover it only when
         // it has been stranded by a process restart.
-        { 'dispatchEngine.status': 'RETRYING', updatedAt: { $lte: strandedBefore } },
+        { 'dispatchEngine.status': { $in: ['RETRYING', 'RESUMING'] }, updatedAt: { $lte: strandedBefore } },
         {
           'dispatchEngine.status': { $in: ['WAITING_NEXT_ROUND', 'WAITING_DRIVER'] },
-          'dispatchEngine.nextRetryAt': { $lte: strandedBefore },
+          'dispatchEngine.nextRetryAt': { $lte: now },
         },
       ],
     }).sort({ createdAt: 1 }).limit(Math.max(1, Math.min(200, Number(limit) || 100))).toArray();
@@ -505,6 +526,48 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     await event(bookingId, 'ADMIN_MANUAL_OFFER', { driverId, offerId: offer._id, adminId }); return { ok: true, offerId: String(offer._id), expiresAt };
   }
 
+  async function diagnostics(rawBookingId) {
+    const bookingId = oid(rawBookingId);
+    if (!bookingId) throw new Error('Booking id không hợp lệ.');
+    const db = getDb();
+    if (!db) throw new Error('Database chưa sẵn sàng.');
+    const booking = await db.collection('bookings').findOne({ _id: bookingId });
+    if (!booking) throw new Error('Không tìm thấy booking.');
+    const [cfg, policy, onlineDrivers, readyDrivers, locationCount, freshLocationCount, activeOffers] = await Promise.all([
+      getConfig(), getMatching().getMatchingPolicy({ refresh: true }),
+      db.collection('drivers').countDocuments({ onlineStatus: 'ONLINE' }),
+      db.collection('drivers').countDocuments({ onlineStatus: 'ONLINE', approvalStatus: 'APPROVED', kycStatus: 'APPROVED' }),
+      db.collection('driver_locations').countDocuments({}),
+      db.collection('driver_locations').countDocuments({ updatedAt: { $gte: new Date(Date.now() - 90000) } }),
+      db.collection('booking_offers_v69').countDocuments({ bookingId, status: 'PENDING', expiresAt: { $gt: new Date() } }),
+    ]);
+    let preview = { candidates: [] }, previewError = null;
+    try { preview = await getMatching().previewCandidates(bookingId, { includeNoGps: false }); }
+    catch (error) { previewError = String(error.message); }
+    const r = cfg.rounds[Math.min(cfg.rounds.length - 1, Math.max(0, Number(booking.dispatchEngine?.currentRound || 0)))];
+    const candidates = preview.candidates || [];
+    const unblocked = candidates.filter(c => !c.pointsBlocked);
+    const nearby = unblocked.filter(c => c.distanceKm != null && Number(c.distanceKm) <= Number(r?.radiusKm || 2));
+    const reasons = [];
+    if (!cfg.enabled || !policy.autoDispatchEnabled) reasons.push('AUTO_DISPATCH_OFF');
+    if (!['SEARCHING', 'OFFERED'].includes(booking.status)) reasons.push('BOOKING_NOT_SEARCHING');
+    if (readyDrivers === 0) reasons.push('NO_APPROVED_ONLINE_DRIVER');
+    if (freshLocationCount === 0) reasons.push('NO_FRESH_DRIVER_GPS');
+    if (readyDrivers && !candidates.length) reasons.push('NO_MATCHING_SERVICE_OR_GPS_DRIVER');
+    if (candidates.length && !unblocked.length) reasons.push('ALL_CANDIDATES_POINTS_BLOCKED');
+    if (unblocked.length && !nearby.length) reasons.push('OUTSIDE_DISPATCH_RADIUS');
+    if (booking.dispatchEngine?.status === 'ERROR') reasons.push('DISPATCH_ERROR');
+    if (previewError) reasons.push('CANDIDATE_PREVIEW_ERROR');
+    return {
+      bookingId: String(bookingId), bookingCode: booking.bookingCode,
+      status: booking.status, serviceCode: booking.serviceCode, dispatch: booking.dispatchEngine || null,
+      config: { enabled: cfg.enabled, maxRounds: cfg.maxRounds, currentRadiusKm: r?.radiusKm },
+      matchingPolicy: { autoDispatchEnabled: policy.autoDispatchEnabled, maxRadiusKm: policy.maxRadiusKm, allowNoGpsFallback: policy.allowNoGpsFallback, locationFreshSeconds: policy.locationFreshSeconds },
+      statistics: { onlineDrivers, approvedOnlineDrivers: readyDrivers, locationRecords: locationCount, freshLocationRecords90s: freshLocationCount, gpsCandidates: candidates.length, eligibleNearby: nearby.length, pendingOffers: activeOffers },
+      previewError, reasons, lastError: booking.dispatchEngine?.lastError || null,
+    };
+  }
+
   async function detail(rawBookingId) {
     const bookingId = oid(rawBookingId); if (!bookingId) throw new Error('Booking id không hợp lệ.');
     const db = getDb(); const [booking, rounds, offers, events] = await Promise.all([
@@ -519,7 +582,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
   async function start() { if (started) return; started = true; sweepTimer = setInterval(() => sweepExpiredOffers().catch(e => console.error('[V6.9 Dispatch sweep]', e.message)), 1000); sweepTimer.unref?.(); }
   function close() { if (sweepTimer) clearInterval(sweepTimer); sweepTimer = null; for (const timer of retryTimers.values()) clearTimeout(timer); retryTimers.clear(); }
 
-  return { databaseReady, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, resumeSearchingBookings, activeOfferForDriver, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, start, close, addCooldown };
+  return { databaseReady, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, resumeSearchingBookings, activeOfferForDriver, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, diagnostics, start, close, addCooldown };
 }
 
 module.exports = { createDispatchEngine, DEFAULT_CONFIG, normalizeConfig };

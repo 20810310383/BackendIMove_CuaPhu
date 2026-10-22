@@ -26,6 +26,7 @@ const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const { assertProductionConfig, buildCorsOptions } = require('./production_guard');
 const { createMapRouter } = require('./map_routes');
+const { verifiedMetrics } = require('./trusted_route_pricing');
 const { createServiceCatalogService } = require('./service_catalog_service');
 const { createServiceCatalogPublicRouter, createServiceCatalogAdminRouter } = require('./service_catalog_routes');
 const { createPricingService } = require('./pricing_service');
@@ -849,8 +850,7 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
 
     const serviceCode = String(body.serviceCode || 'BIKE').toUpperCase();
     const areaCode = String(body.areaCode || 'GLOBAL').toUpperCase();
-    const distanceKm = Number(clientQuote.distanceKm || body.distanceKm || 0);
-    const durationMinutes = Number(clientQuote.durationMinutes || body.durationMinutes || 0);
+    const {distanceKm,durationMinutes}=await verifiedMetrics({pickup,destination,vehicleType:serviceCode==='BIKE'?'MOTORBIKE':'CAR'});
 
     // Không tin giá/giảm giá từ Flutter. Backend luôn tính lại từ Atlas.
     const pricingResult = await pricingService.estimateFare({ serviceCode, areaCode, distanceKm, durationMinutes });
@@ -949,8 +949,12 @@ app.post('/api/bookings', requireCustomer, async (req, res) => {
     }
     return res.status(201).json(serializeBooking(doc));
   } catch (error) {
+    if(error?.code===11000){
+      const existing=await db.collection('bookings').findOne({customerId:req.auth.user._id,status:{$in:['SEARCHING','DRIVER_ASSIGNED','DRIVER_ARRIVING','DRIVER_ARRIVED','IN_PROGRESS']}});
+      return res.status(409).json({code:'ACTIVE_BOOKING_EXISTS',message:'Bạn đang có một chuyến hoạt động.',booking:existing?serializeBooking(existing):null});
+    }
     console.error(error);
-    return res.status(400).json({ message: error.message });
+    return res.status(error.httpStatus||400).json({code:error.code||null,message:error.message});
   }
 });
 

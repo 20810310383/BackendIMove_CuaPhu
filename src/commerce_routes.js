@@ -3,14 +3,20 @@ const { ObjectId } = require('mongodb');
 const fs = require('fs');
 const path = require('path');
 const multer = require('multer');
+const crypto = require('crypto');
 const { createAuthenticate } = require('./auth_routes');
 const { createAdminGuard } = require('./admin_guard');
-const { effectiveApproval, isMerchantApproved, approvedMerchantQuery } = require('./merchant_approval');
+const { verifiedMetrics } = require('./trusted_route_pricing');
 
 const ORDER_STATUSES = [
   'CREATED','WAITING_MERCHANT','MERCHANT_ACCEPTED','PREPARING','READY_FOR_PICKUP',
   'DRIVER_ASSIGNED','DRIVER_AT_MERCHANT','PICKED_UP','DELIVERING','DELIVERED','COMPLETED','CANCELLED'
 ];
+const COMMERCE_SERVICE_CODES = ['FOOD','ERRAND','DELIVERY'];
+// Keep the operations feed small and page it on the server so a slow MongoDB
+// connection does not need to read every commerce order for one screen.
+const ADMIN_COMMERCE_ORDERS_LIMIT = 20;
+const ADMIN_COMMERCE_ORDERS_MAX_LIMIT = 200;
 const MERCHANT_TRANSITIONS = {
   WAITING_MERCHANT: ['MERCHANT_ACCEPTED','CANCELLED'],
   MERCHANT_ACCEPTED: ['PREPARING','READY_FOR_PICKUP','CANCELLED'],
@@ -67,7 +73,8 @@ async function priceDeliveryExtras({db,baseFee,details,user}){
   const input=details&&typeof details==='object'?details:{};
   const preference=normalizePreference(input.deliveryPreference);
   const fragile=Boolean(input.fragile);
-  const codAmount=Math.max(0,Number(input.codAmount||0));
+  const codAmount=Number(input.codAmount||0);
+  if(!Number.isSafeInteger(codAmount)||codAmount<0||codAmount>1000000000)throw Object.assign(new Error('Số tiền thu hộ COD không hợp lệ.'),{code:'INVALID_COD_AMOUNT'});
   if(codAmount>0){
     if(!policy.cod.enabled) { const e=new Error('Thu hộ COD đang tắt trên hệ thống.');e.code='COD_DISABLED';throw e; }
     if(policy.cod.requireKyc&&!customerKycApproved(user)){const e=new Error('Thu hộ COD chỉ dành cho khách hàng đã KYC. Vui lòng hoàn tất KYC trước khi bật COD.');e.code='CUSTOMER_KYC_REQUIRED_FOR_COD';throw e;}
@@ -80,6 +87,21 @@ async function priceDeliveryExtras({db,baseFee,details,user}){
 
 function oid(value) {
   try { return new ObjectId(String(value)); } catch (_) { return null; }
+}
+
+async function ensureCommerceIndexes(db) {
+  await Promise.all([
+    db.collection('orders').createIndex(
+      { serviceCode: 1, createdAt: -1 },
+      { name: 'idx_commerce_orders_recent' },
+    ),
+    db.collection('orders').createIndex(
+      { serviceCode: 1, status: 1, createdAt: -1 },
+      { name: 'idx_commerce_orders_service_status_recent' },
+    ),
+  ]).catch((error) => {
+    console.warn('[COMMERCE INDEX]', error.message);
+  });
 }
 function serialize(value) {
   if (!value) return value;
@@ -147,7 +169,7 @@ function deleteOldMerchantMedia(urlValue, merchantId) {
 function orderCode() {
   const d = new Date();
   const stamp = `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
-  return `IMF-${stamp}-${String(Date.now()).slice(-6)}`;
+  return `IMF-${stamp}-${Date.now().toString(36).toUpperCase()}-${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 }
 async function merchantContext(db, userId) {
   const membership = await db.collection('merchant_users').findOne({ userId });
@@ -249,10 +271,14 @@ async function eligibleCommerceDrivers(db, serviceCode, { onlineOnly = true } = 
 
 async function dispatchCommerceReady({ db, order, notificationService, actorType = 'SYSTEM', actorId = null }) {
   if (!order) return { candidates: [] };
+  const allowed = (['FOOD','ERRAND'].includes(order.serviceCode) && order.status === 'READY_FOR_PICKUP') ||
+    (order.serviceCode === 'DELIVERY' && order.status === 'CREATED') ||
+    (order.serviceCode === 'ERRAND' && !order.merchantId && order.status === 'CREATED');
+  if (!allowed || order.driverId) return { candidates: [], skipped: 'ORDER_NOT_DISPATCHABLE' };
   const candidates = await eligibleCommerceDrivers(db, order.serviceCode, { onlineOnly: true });
   const now = new Date();
-  await db.collection('orders').updateOne(
-    { _id: order._id },
+  const claimed = await db.collection('orders').updateOne(
+    { _id: order._id, driverId: null, status: order.status },
     {
       $set: {
         dispatchStatus: candidates.length ? 'SEARCHING' : 'NO_DRIVER',
@@ -263,6 +289,7 @@ async function dispatchCommerceReady({ db, order, notificationService, actorType
         dispatchUpdatedAt: now,
         updatedAt: now,
       },
+      $inc: { dispatchAttempt: 1 },
       $push: {
         timeline: {
           status: 'DISPATCH_STARTED', at: now, actorType, actorId,
@@ -271,17 +298,20 @@ async function dispatchCommerceReady({ db, order, notificationService, actorType
       },
     },
   );
+  if (!claimed.modifiedCount) return { candidates: [], skipped: 'ORDER_STATE_CHANGED' };
+  const current = await db.collection('orders').findOne({ _id: order._id });
+  const attempt = Number(current?.dispatchAttempt || 1);
 
   if (notificationService && candidates.length) {
     await Promise.all(candidates.map((driver) => notificationService.enqueue({
-      dedupeKey: `COMMERCE:${String(order._id)}:READY:${String(driver._id)}`,
+      dedupeKey: `COMMERCE:${String(order._id)}:READY:${attempt}:${String(driver._id)}`,
       type: 'COMMERCE_ORDER',
       targetType: 'DRIVER',
       targetId: driver._id,
       level: 2,
       title: order.serviceCode === 'FOOD' ? 'Có đơn đồ ăn sẵn sàng' : order.serviceCode === 'ERRAND' ? 'Có đơn mua hộ sẵn sàng' : 'Có đơn giao hàng mới',
       body: `${order.orderCode || 'Đơn mới'} · ${order.merchantSnapshot?.name || order.pickup?.address || 'Điểm lấy hàng'}`,
-      data: { orderId: String(order._id), status: 'READY_FOR_PICKUP', serviceCode: order.serviceCode },
+      data: { orderId: String(order._id), status: order.status, serviceCode: order.serviceCode },
     }).catch(() => null)));
   }
   return { candidates };
@@ -354,7 +384,7 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
   });
   r.get('/merchants', async (req,res) => {
     try {
-      const q = { $and: [{ status: { $in:['ACTIVE','OPEN','BUSY'] } }, approvedMerchantQuery()] };
+      const q = { status: { $in:['ACTIVE','OPEN','BUSY'] } };
       if (req.query.category) q.categoryCode = String(req.query.category).toUpperCase();
       if (req.query.merchantType) q.merchantType = String(req.query.merchantType).toUpperCase();
       const rows = await getDb().collection('merchants').find(q).sort({ rating:-1, name:1 }).limit(100).toArray();
@@ -364,8 +394,6 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
   r.get('/merchants/:id/products', async (req,res) => {
     try {
       const merchantId = oid(req.params.id); if (!merchantId) return res.status(400).json({message:'Merchant ID không hợp lệ.'});
-      const merchant = await getDb().collection('merchants').findOne({ _id: merchantId });
-      if (!merchant || !isMerchantApproved(merchant) || !['ACTIVE','OPEN','BUSY'].includes(String(merchant.status||'').toUpperCase())) return res.status(404).json({message:'Cửa hàng chưa hoạt động hoặc chưa được duyệt.'});
       const products = await getDb().collection('products').find({ merchantId, status:'ACTIVE' }).sort({categoryName:1,sortOrder:1,name:1}).toArray();
       res.json({ products: products.map(serialize) });
     } catch (e) { res.status(500).json({ message:e.message }); }
@@ -374,8 +402,7 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
     try {
       const serviceCode = String(req.body?.serviceCode||'FOOD').toUpperCase();
       if (!['FOOD','DELIVERY','ERRAND'].includes(serviceCode)) return res.status(400).json({message:'Dịch vụ commerce không hợp lệ.'});
-      const distanceKm = Number(req.body?.distanceKm||0);
-      const durationMinutes = Number(req.body?.durationMinutes||0);
+      const {distanceKm,durationMinutes}=await verifiedMetrics({pickup:req.body?.pickup,destination:req.body?.destination});
       const pricing = await getPricing().estimateFare({serviceCode,areaCode:req.body?.areaCode||'GLOBAL',distanceKm,durationMinutes});
       if (!pricing.available) return res.status(409).json({code:'FARE_UNAVAILABLE',message:pricing.reason});
       let fare={...pricing.fareSnapshot};
@@ -387,19 +414,29 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
         deliveryPolicy={codAllowed:extra.policy.cod.enabled&&(!extra.policy.cod.requireKyc||customerKycApproved(req.auth.user)),codEnabled:extra.policy.cod.enabled,requireKyc:extra.policy.cod.requireKyc};
       }
       res.json({ fare, deliveryPolicy });
-    } catch(e){res.status(400).json({message:e.message});}
+    } catch(e){res.status(e.httpStatus||400).json({code:e.code||null,message:e.message});}
   });
   r.post('/orders', requireCustomer, async (req,res) => {
     try {
       const serviceCode = String(req.body?.serviceCode||'FOOD').toUpperCase();
       if (!['FOOD','DELIVERY','ERRAND'].includes(serviceCode)) return res.status(400).json({message:'serviceCode không hợp lệ.'});
       const merchantId = req.body?.merchantId ? oid(req.body.merchantId) : null;
-      if (['FOOD','ERRAND'].includes(serviceCode) && !merchantId) return res.status(400).json({message:`Đơn ${serviceCode} phải có nhà hàng/cửa hàng.`});
+      if (serviceCode==='FOOD' && !merchantId) return res.status(400).json({message:'Đơn FOOD phải có nhà hàng/cửa hàng.'});
       const db = getDb();
+      const idempotencyKey=String(req.get('idempotency-key')||'').trim();
+      if(idempotencyKey && !/^[A-Za-z0-9._:-]{12,128}$/.test(idempotencyKey))return res.status(400).json({code:'INVALID_IDEMPOTENCY_KEY',message:'Idempotency-Key phải gồm 12–128 ký tự hợp lệ.'});
+      const requestDigest=idempotencyKey?crypto.createHash('sha256').update(JSON.stringify(req.body||{})).digest('hex'):null;
+      const idemFilter=idempotencyKey?{customerId:req.auth.user._id,idempotencyKey}:null;
+      if(idemFilter){
+        const prior=await db.collection('orders').findOne(idemFilter);
+        if(prior){
+          if(prior.requestDigest!==requestDigest)return res.status(409).json({code:'IDEMPOTENCY_KEY_CONFLICT',message:'Khóa yêu cầu đã được dùng với nội dung khác.'});
+          return res.status(200).json({order:serialize(prior),duplicate:true});
+        }
+      }
       let merchant = null;
       if (merchantId) {
-        merchant = await db.collection('merchants').findOne({ _id: merchantId });
-        if (merchant && (!isMerchantApproved(merchant) || !['ACTIVE','OPEN','BUSY'].includes(String(merchant.status||'').toUpperCase()))) merchant = null;
+        merchant = await db.collection('merchants').findOne({_id:merchantId,status:{$nin:['SUSPENDED','CLOSED_PERMANENTLY']}});
         if(!merchant) return res.status(404).json({message:'Không tìm thấy cửa hàng đang hoạt động.'});
       }
       const rawItems = Array.isArray(req.body?.items) ? req.body.items : [];
@@ -410,28 +447,34 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
         if (!productId) continue;
         const product = await db.collection('products').findOne({_id:productId,merchantId,status:'ACTIVE'});
         if (!product) continue;
-        const qty = Math.min(99,Math.max(1,Number(item.quantity||1)));
-        const line = Math.round(Number(product.price||0)*qty);
+        const requestedQty=Number(item.quantity);
+        if(!Number.isSafeInteger(requestedQty)||requestedQty<1||requestedQty>99) return res.status(400).json({message:'Số lượng sản phẩm phải là số nguyên từ 1 đến 99.'});
+        const qty=requestedQty;
+        const unitPrice=Number(product.price);
+        if(!Number.isSafeInteger(unitPrice)||unitPrice<0) return res.status(409).json({message:'Giá sản phẩm chưa hợp lệ.'});
+        const line=unitPrice*qty;
+        if(!Number.isSafeInteger(line)||!Number.isSafeInteger(subtotal+line))return res.status(409).json({message:'Giá trị giỏ hàng vượt giới hạn.'});
         subtotal += line;
         items.push({productId:product._id,name:product.name,unitPrice:Number(product.price||0),quantity:qty,lineTotal:line});
       }
-      if (['FOOD','ERRAND'].includes(serviceCode) && !items.length) return res.status(400).json({message:'Giỏ hàng chưa có sản phẩm hợp lệ.'});
-      const distanceKm = Number(req.body?.distanceKm||0);
-      const durationMinutes = Number(req.body?.durationMinutes||0);
+      if ((serviceCode==='FOOD' || (serviceCode==='ERRAND' && merchantId)) && !items.length) return res.status(400).json({message:'Giỏ hàng chưa có sản phẩm hợp lệ.'});
+      const {distanceKm,durationMinutes}=await verifiedMetrics({pickup:req.body?.pickup,destination:req.body?.destination});
       const pricing = await getPricing().estimateFare({serviceCode,areaCode:req.body?.areaCode||'GLOBAL',distanceKm,durationMinutes});
       if (!pricing.available) return res.status(409).json({code:'FARE_UNAVAILABLE',message:pricing.reason});
       const baseDeliveryFee = Number(pricing.fareSnapshot?.customerTotal||pricing.fareSnapshot?.total||0);
       const deliveryExtra = serviceCode==='DELIVERY'
         ? await priceDeliveryExtras({db,baseFee:baseDeliveryFee,details:req.body?.deliveryDetails,user:req.auth.user})
         : {total:baseDeliveryFee,preference:'STANDARD',preferenceSurcharge:0,fragileSurcharge:0,codAmount:0};
-      const deliveryFee = Number(deliveryExtra.total||0);
+      const deliveryFee = Number(deliveryExtra.total);
+      if(!Number.isSafeInteger(deliveryFee)||deliveryFee<0||!Number.isSafeInteger(subtotal+deliveryFee))return res.status(409).json({code:'INVALID_FARE',message:'Không thể xác định giá đơn hàng hợp lệ.'});
       const fareSnapshot={...pricing.fareSnapshot,customerTotal:deliveryFee,total:deliveryFee,deliveryExtra:{preference:deliveryExtra.preference,preferenceSurcharge:deliveryExtra.preferenceSurcharge,fragileSurcharge:deliveryExtra.fragileSurcharge,codAmount:deliveryExtra.codAmount},breakdown:{...(pricing.fareSnapshot?.breakdown||{}),baseDeliveryFee,preferenceSurcharge:deliveryExtra.preferenceSurcharge,fragileSurcharge:deliveryExtra.fragileSurcharge}};
       const now = new Date();
       const doc = {
-        orderCode:orderCode(),serviceCode,customerId:req.auth.user._id,merchantId,driverId:null,
+        orderCode:orderCode(),serviceCode,customerId:req.auth.user._id,
+        ...(idempotencyKey?{idempotencyKey,requestDigest}:{}),merchantId,driverId:null,
         status:merchantId?'WAITING_MERCHANT':'CREATED',items,subtotal,deliveryFee,
-        serviceFee:Number(req.body?.serviceFee||0),discount:Number(req.body?.discount||0),
-        total:Math.max(0,subtotal+deliveryFee+Number(req.body?.serviceFee||0)-Number(req.body?.discount||0)),
+        serviceFee:0,discount:0,
+        total:subtotal+deliveryFee, // Only server-computed amounts are allowed here.
         fareSnapshot,
         pickup:req.body?.pickup||null,destination:req.body?.destination||null,
         customerNote:String(req.body?.customerNote||'').slice(0,500),paymentMethod:String(req.body?.paymentMethod||'CASH').toUpperCase(),paymentStatus:'UNPAID',
@@ -448,7 +491,17 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
         setImmediate(()=>dispatchCommerceReady({db,order:doc,notificationService:getNotifications?getNotifications():null,actorType:'SYSTEM'}).catch((error)=>console.error('[COMMERCE AUTO DISPATCH]',error.message)));
       }
       res.status(201).json({order:serialize(doc),autoDispatch:!merchantId});
-    } catch(e){res.status(400).json({message:e.message});}
+    } catch(e){
+      if(e?.code===11000 && req.get('idempotency-key')){
+        const prior=await getDb().collection('orders').findOne({customerId:req.auth.user._id,idempotencyKey:String(req.get('idempotency-key')).trim()});
+        if(prior){
+          const incomingDigest=crypto.createHash('sha256').update(JSON.stringify(req.body||{})).digest('hex');
+          if(prior.requestDigest!==incomingDigest)return res.status(409).json({code:'IDEMPOTENCY_KEY_CONFLICT',message:'Khóa yêu cầu đã được dùng với nội dung khác.'});
+          return res.status(200).json({order:serialize(prior),duplicate:true});
+        }
+      }
+      res.status(e.httpStatus|| (e?.code===11000?409:400)).json({code:e.code||null,message:e.message});
+    }
   });
   r.get('/orders', requireCustomer, async (req,res) => {
     try { const rows=await getDb().collection('orders').find({customerId:req.auth.user._id}).sort({createdAt:-1}).limit(100).toArray();res.json({orders:rows.map(serialize)}); }
@@ -487,7 +540,8 @@ function createMerchantRouter({ getDb, getNotifications }) {
       const allowed=MERCHANT_TRANSITIONS[current.status]||[];
       if(!allowed.includes(next))return res.status(409).json({message:`Merchant không thể chuyển ${current.status} → ${next}.`});
       const now=new Date();
-      await db.collection('orders').updateOne({_id},{$set:{status:next,updatedAt:now,...(next==='READY_FOR_PICKUP'?{readyAt:now}:{}),...(next==='CANCELLED'?{cancelledAt:now,cancelReason:String(req.body?.reason||'MERCHANT_CANCELLED')}: {})},$push:{timeline:{status:next,at:now,actorType:'MERCHANT',actorId:req.auth.user._id}}});
+      const stateUpdate=await db.collection('orders').updateOne({_id,merchantId:req.merchantContext.merchant._id,status:current.status},{$set:{status:next,updatedAt:now,...(next==='READY_FOR_PICKUP'?{readyAt:now}:{}),...(next==='CANCELLED'?{cancelledAt:now,cancelReason:String(req.body?.reason||'MERCHANT_CANCELLED')}: {})},$push:{timeline:{status:next,at:now,actorType:'MERCHANT',actorId:req.auth.user._id}}});
+      if(stateUpdate.matchedCount!==1)return res.status(409).json({code:'ORDER_STATE_CHANGED',message:'Đơn hàng đã đổi trạng thái trên thiết bị khác. Vui lòng tải lại.'});
       let updatedOrder=await db.collection('orders').findOne({_id});
       let dispatchResult=null;
       if(next==='READY_FOR_PICKUP' && updatedOrder){
@@ -534,7 +588,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
   });
   r.get('/store', (req,res)=>res.json({merchant:serialize(req.merchantContext.merchant)}));
   r.put('/store', async (req,res)=>{
-    try{const patch={};for(const k of ['name','address','phone','description','status','openingHours','pickupInstruction','logoUrl','coverUrl','categoryName'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];if(patch.status!==undefined){const requested=String(patch.status).toUpperCase();if(!['ACTIVE','OPEN','BUSY','PAUSED','SUSPENDED'].includes(requested))return res.status(400).json({message:'Trạng thái cửa hàng không hợp lệ.'});if(!isMerchantApproved(req.merchantContext.merchant)&&['ACTIVE','OPEN','BUSY'].includes(requested))return res.status(403).json({code:'MERCHANT_NOT_APPROVED',message:'Hồ sơ chưa được Admin duyệt, chưa thể mở bán.'});patch.status=requested;}if(req.body?.merchantType!==undefined){const type=String(req.body.merchantType).toUpperCase();if(!['STORE','RESTAURANT'].includes(type))return res.status(400).json({message:'merchantType phải là STORE hoặc RESTAURANT.'});patch.merchantType=type;patch.merchantTypeLabel=type==='RESTAURANT'?'Nhà hàng · Food':'Cửa hàng · Đặt hộ';patch.categoryCode=type==='RESTAURANT'?'FOOD':'ERRAND';}patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id:req.merchantContext.merchant._id},{$set:patch});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id}))});}catch(e){res.status(400).json({message:e.message});}
+    try{const patch={};for(const k of ['name','address','phone','description','status','openingHours','pickupInstruction','logoUrl','coverUrl','categoryName'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];if(req.body?.merchantType!==undefined){const type=String(req.body.merchantType).toUpperCase();if(!['STORE','RESTAURANT'].includes(type))return res.status(400).json({message:'merchantType phải là STORE hoặc RESTAURANT.'});patch.merchantType=type;patch.merchantTypeLabel=type==='RESTAURANT'?'Nhà hàng · Food':'Cửa hàng · Đặt hộ';patch.categoryCode=type==='RESTAURANT'?'FOOD':'ERRAND';}patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id:req.merchantContext.merchant._id},{$set:patch});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id}))});}catch(e){res.status(400).json({message:e.message});}
   });
   r.post('/store/media/:kind', merchantMediaUpload.single('image'), async (req,res)=>{
     try {
@@ -618,54 +672,35 @@ function createCommerceDriverRouter({ getDb, requireApprovedDriver, findDriverBy
 function createCommerceAdminRouter({ getDb, getNotifications }) {
   const r=express.Router();const {requireAdmin,permit}=createAdminGuard({getDb});r.use(requireAdmin);
   r.get('/delivery-policy',permit('orders.view'),async(_req,res)=>{try{res.json({policy:await getDeliveryPolicy(getDb())});}catch(e){res.status(500).json({message:e.message});}});
-  r.put('/delivery-policy',permit('orders.view'),async(req,res)=>{try{const db=getDb(),now=new Date();const current=await getDeliveryPolicy(db);const policy={standard:normalizeFeeRule(req.body?.standard,current.standard),priority:normalizeFeeRule(req.body?.priority,current.priority),fragile:normalizeFeeRule(req.body?.fragile,current.fragile),cod:{enabled:Boolean(req.body?.cod?.enabled),requireKyc:req.body?.cod?.requireKyc!==false},updatedAt:now,updatedBy:req.admin._id};await db.collection('commerce_settings').updateOne({_id:'DELIVERY_FEE_POLICY'},{$set:policy},{upsert:true});await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'DELIVERY_POLICY_UPDATE',entityType:'COMMERCE_SETTING',entityId:'DELIVERY_FEE_POLICY',after:policy,createdAt:now});res.json({policy});}catch(e){res.status(400).json({message:e.message});}});
+  r.put('/delivery-policy',permit('orders.policy.manage'),async(req,res)=>{try{const db=getDb(),now=new Date();const current=await getDeliveryPolicy(db);const policy={standard:normalizeFeeRule(req.body?.standard,current.standard),priority:normalizeFeeRule(req.body?.priority,current.priority),fragile:normalizeFeeRule(req.body?.fragile,current.fragile),cod:{enabled:Boolean(req.body?.cod?.enabled),requireKyc:req.body?.cod?.requireKyc!==false},updatedAt:now,updatedBy:req.admin._id};await db.collection('commerce_settings').updateOne({_id:'DELIVERY_FEE_POLICY'},{$set:policy},{upsert:true});await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'DELIVERY_POLICY_UPDATE',entityType:'COMMERCE_SETTING',entityId:'DELIVERY_FEE_POLICY',after:policy,createdAt:now});res.json({policy});}catch(e){res.status(400).json({message:e.message});}});
   r.get('/merchants',permit('merchants.view'),async(req,res)=>{try{const rows=await getDb().collection('merchants').find({}).sort({createdAt:-1}).limit(500).toArray();res.json({merchants:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
-  // Separate KYC/registration approval from trading status.
-  r.get('/merchants/:id/review',permit('merchants.view'),async(req,res)=>{
+  r.put('/merchants/:id',permit('merchants.manage'),async(req,res)=>{try{const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});const patch={};for(const k of ['status','name','commissionRate','categoryCode','merchantType','merchantTypeLabel','categoryName','logoUrl','coverUrl'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id},{$set:patch});await getDb().collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'MERCHANT_UPDATE',entityType:'MERCHANT',entityId:String(_id),after:patch,createdAt:new Date()});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id}))});}catch(e){res.status(400).json({message:e.message});}});
+  r.get('/orders',permit('orders.view'),async(req,res)=>{
     try{
-      const db=getDb(),_id=oid(req.params.id);
-      if(!_id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});
-      const merchant=await db.collection('merchants').findOne({_id});
-      if(!merchant)return res.status(404).json({message:'Không tìm thấy cửa hàng.'});
-      const membership=await db.collection('merchant_users').findOne({merchantId:_id,role:'OWNER'});
-      const owner=membership?await db.collection('users').findOne({_id:membership.userId},{projection:{fullName:1,phone:1,email:1}}):null;
-      const history=await db.collection('merchant_approval_events').find({merchantId:_id}).sort({createdAt:-1}).limit(30).toArray();
-      // No KYC document pipeline is available in the current merchant registration code.
-      // Never fabricate verified documents or expose private filesystem paths.
-      res.json({merchant:serialize({...merchant,approvalStatus:effectiveApproval(merchant)}),owner:owner?{fullName:owner.fullName||'',phone:owner.phone||'',email:owner.email||''}:null,documents:[],documentsSubmissionSupported:false,history:history.map(x=>({status:x.status,reason:x.reason||'',createdAt:x.createdAt,reviewerId:String(x.reviewerId||'')}))});
-    }catch(e){res.status(500).json({message:'Không lấy được hồ sơ Merchant.'});}
+      const q={serviceCode:{$in:COMMERCE_SERVICE_CODES}};
+      if(req.query.status)q.status=String(req.query.status).toUpperCase();
+      if(req.query.serviceCode){
+        const serviceCode=String(req.query.serviceCode).toUpperCase();
+        if(!COMMERCE_SERVICE_CODES.includes(serviceCode))return res.status(400).json({message:'serviceCode commerce không hợp lệ.'});
+        q.serviceCode=serviceCode;
+      }
+      const requestedLimit=Number(req.query.limit||ADMIN_COMMERCE_ORDERS_LIMIT);
+      const limit=Math.max(1,Math.min(ADMIN_COMMERCE_ORDERS_MAX_LIMIT,Number.isFinite(requestedLimit)?requestedLimit:ADMIN_COMMERCE_ORDERS_LIMIT));
+      const requestedPage=Number(req.query.page||1);
+      const page=Math.max(1,Math.min(10000,Number.isFinite(requestedPage)?Math.floor(requestedPage):1));
+      // Fetch one extra record instead of countDocuments: it keeps this query
+      // index-friendly while still letting the web app enable "Trang sau".
+      const rows=await getDb().collection('orders').find(q,{
+        maxTimeMS:12000,
+        projection:{orderCode:1,serviceCode:1,merchantId:1,merchantSnapshot:1,pickup:1,customerSnapshot:1,status:1,dispatchStatus:1,dispatchCandidateCount:1,dispatchTriggeredBy:1,driverId:1,total:1,deliveryFee:1,createdAt:1},
+      }).sort({createdAt:-1}).skip((page-1)*limit).limit(limit+1).toArray();
+      const hasNext=rows.length>limit;
+      res.json({orders:rows.slice(0,limit).map(serialize),limit,page,hasNext,hasPrevious:page>1});
+    }catch(e){
+      const timedOut=e?.code===50||/time limit|maxtime/i.test(String(e?.message||''));
+      res.status(timedOut?503:500).json({code:timedOut?'COMMERCE_QUERY_TIMEOUT':'COMMERCE_QUERY_FAILED',message:timedOut?'Truy vấn đơn commerce quá thời gian. Backend sẽ tự thử lại khi dữ liệu sẵn sàng.':e.message});
+    }
   });
-  r.post('/merchants/:id/review',permit('merchants.manage'),async(req,res)=>{
-    try{
-      const db=getDb(),_id=oid(req.params.id);
-      if(!_id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});
-      const action=String(req.body?.action||'').toUpperCase();
-      const reason=String(req.body?.reason||'').trim().slice(0,1000);
-      const next={APPROVE:'APPROVED',REJECT:'REJECTED',REOPEN:'PENDING_REVIEW'}[action];
-      if(!next)return res.status(400).json({message:'Thao tác không hợp lệ.'});
-      if(action==='REJECT' && reason.length<10)return res.status(400).json({message:'Vui lòng nhập lý do từ chối tối thiểu 10 ký tự.'});
-      const existing=await db.collection('merchants').findOne({_id});
-      if(!existing)return res.status(404).json({message:'Không tìm thấy cửa hàng.'});
-      if(effectiveApproval(existing)===next)return res.status(409).json({message:'Hồ sơ đã ở trạng thái này.'});
-      if(action==='APPROVE' && (![existing.name,existing.phone,existing.address].every(v=>String(v||'').trim().length>=2)))return res.status(422).json({message:'Hồ sơ thiếu tên, số điện thoại hoặc địa chỉ. Vui lòng bổ sung trước khi duyệt.'});
-      const now=new Date();
-      // Match the reviewed version; concurrent actions must not silently override each other.
-      const filter={_id,approvalStatus:existing.approvalStatus===undefined?{$exists:false}:existing.approvalStatus};
-      const patch={approvalStatus:next,approvalReviewedAt:now,approvalReviewedBy:req.admin._id,approvalReason:action==='REJECT'?reason:null,updatedAt:now};
-      if(action==='APPROVE')patch.status='ACTIVE';
-      else patch.status='PENDING'; // hard block trade while rejected/awaiting review
-      const result=await db.collection('merchants').updateOne(filter,{$set:patch});
-      if(!result.matchedCount)return res.status(409).json({message:'Hồ sơ vừa được người khác cập nhật, vui lòng tải lại.'});
-      const event={merchantId:_id,status:next,action,reason:action==='REJECT'?reason:'',reviewerId:req.admin._id,previousStatus:effectiveApproval(existing),createdAt:now};
-      await Promise.allSettled([
-        db.collection('merchant_approval_events').insertOne(event),
-        db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:`MERCHANT_${action}`,entityType:'MERCHANT',entityId:String(_id),before:{approvalStatus:effectiveApproval(existing),status:existing.status},after:patch,createdAt:now}),
-      ]);
-      res.json({merchant:serialize(await db.collection('merchants').findOne({_id})),message:action==='APPROVE'?'Đã duyệt hồ sơ Merchant.':action==='REJECT'?'Đã từ chối hồ sơ Merchant.':'Đã chuyển hồ sơ về chờ duyệt.'});
-    }catch(e){res.status(500).json({message:'Không thể cập nhật kết quả duyệt hồ sơ.'});}
-  });
-  r.put('/merchants/:id',permit('merchants.manage'),async(req,res)=>{try{const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Merchant ID không hợp lệ.'});const current=await getDb().collection('merchants').findOne({_id});if(!current)return res.status(404).json({message:'Không tìm thấy Merchant.'});if(req.body?.status!==undefined){const requested=String(req.body.status).toUpperCase();if(!['ACTIVE','OPEN','BUSY','PAUSED','SUSPENDED'].includes(requested))return res.status(400).json({message:'Trạng thái hoạt động không hợp lệ.'});if(['ACTIVE','OPEN','BUSY'].includes(requested)&&!isMerchantApproved(current))return res.status(409).json({code:'MERCHANT_NOT_APPROVED',message:'Hãy duyệt hồ sơ trước khi bật cửa hàng.'});}const patch={};for(const k of ['status','name','commissionRate','categoryCode','merchantType','merchantTypeLabel','categoryName','logoUrl','coverUrl'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id},{$set:patch});await getDb().collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'MERCHANT_UPDATE',entityType:'MERCHANT',entityId:String(_id),after:patch,createdAt:new Date()});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id}))});}catch(e){res.status(400).json({message:e.message});}});
-  r.get('/orders',permit('orders.view'),async(req,res)=>{try{const q={};if(req.query.status)q.status=String(req.query.status).toUpperCase();if(req.query.serviceCode)q.serviceCode=String(req.query.serviceCode).toUpperCase();const rows=await getDb().collection('orders').find(q).sort({createdAt:-1}).limit(500).toArray();res.json({orders:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
   r.get('/orders/:id/candidates',permit('orders.view'),async(req,res)=>{
     try{
       const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Order ID không hợp lệ.'});
@@ -674,8 +709,8 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
       res.json({order:serialize(order),drivers:drivers.map((d)=>({id:String(d._id),fullName:d.fullName,phone:d.phone,onlineStatus:d.onlineStatus,rating:Number(d.rating||0),completedTrips:Number(d.completedTrips||0),pointBalance:Number(d.pointBalance||0),pointStatus:d.pointStatus,pointWarning:d.pointWarning,serviceCapabilities:normalizeCaps(d)}))});
     }catch(e){res.status(500).json({message:e.message});}
   });
-  // Giữ quyền orders.view để các role vận hành hiện hữu có thể điều phối commerce mà không cần migrate role thủ công.
-  r.post('/orders/:id/dispatch',permit('orders.view'),async(req,res)=>{
+  // Explicit write permission; viewers cannot dispatch orders.
+  r.post('/orders/:id/dispatch',permit('orders.dispatch'),async(req,res)=>{
     try{
       const db=getDb(),_id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Order ID không hợp lệ.'});
       const order=await db.collection('orders').findOne({_id});if(!order)return res.status(404).json({message:'Không tìm thấy đơn.'});
@@ -701,9 +736,11 @@ function createCommerceDispatchWorker({getDb,getNotifications,intervalMs=10000})
     const db=getDb();if(!db||busy)return;busy=true;
     try{
       const cutoff=new Date(Date.now()-5000);
-      const rows=await db.collection('orders').find({driverId:null,updatedAt:{$lte:cutoff},$or:[{serviceCode:'DELIVERY',status:'CREATED'},{serviceCode:{$in:['FOOD','ERRAND']},status:'READY_FOR_PICKUP'}]}).sort({updatedAt:1}).limit(20).toArray();
+      const rows=await db.collection('orders').find({driverId:null,updatedAt:{$lte:cutoff},$or:[{serviceCode:'DELIVERY',status:'CREATED'},{serviceCode:'ERRAND',merchantId:null,status:'CREATED'},{serviceCode:{$in:['FOOD','ERRAND']},status:'READY_FOR_PICKUP'}]}).sort({updatedAt:1}).limit(20).toArray();
       for(const order of rows){
-        if(order.dispatchStatus==='SEARCHING' && order.dispatchStartedAt && Date.now()-new Date(order.dispatchStartedAt).getTime()<15000) continue;
+        // A dispatch attempt already notified drivers. Re-broadcast no more
+        // than once per minute unless Admin explicitly retries this order.
+        if(order.dispatchStartedAt && Date.now()-new Date(order.dispatchStartedAt).getTime()<60000) continue;
         await dispatchCommerceReady({db,order,notificationService:getNotifications?getNotifications():null,actorType:'SYSTEM'}).catch(()=>{});
       }
     }finally{busy=false;}
@@ -711,4 +748,4 @@ function createCommerceDispatchWorker({getDb,getNotifications,intervalMs=10000})
   return {start(){if(timer)return;timer=setInterval(tick,Math.max(5000,Number(intervalMs)||10000));timer.unref?.();setTimeout(tick,1500);},close(){if(timer)clearInterval(timer);timer=null;}};
 }
 
-module.exports={createCommercePublicRouter,createMerchantRouter,createCommerceDriverRouter,createCommerceAdminRouter,createCommerceDispatchWorker,ORDER_STATUSES};
+module.exports={createCommercePublicRouter,createMerchantRouter,createCommerceDriverRouter,createCommerceAdminRouter,createCommerceDispatchWorker,ensureCommerceIndexes,ORDER_STATUSES};

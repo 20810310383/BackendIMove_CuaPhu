@@ -85,6 +85,15 @@ function buildCorsOptions() {
     origin(origin, callback) {
       if (!origin) return callback(null, true);
       if (allowed.has(origin)) return callback(null, true);
+      try {
+        const parsed = new URL(origin);
+        const validOrigin = parsed.origin === origin && parsed.protocol === 'https:';
+        if (validOrigin && [...allowed].some(pattern => {
+          if (!pattern.startsWith('https://*.')) return false;
+          const suffix=pattern.slice('https://*.'.length).toLowerCase();
+          return parsed.hostname.toLowerCase().endsWith('.'+suffix) && parsed.hostname.length>suffix.length+1 && !parsed.port;
+        })) return callback(null, true);
+      } catch (_) { /* malformed origin denied */ }
       return callback(new Error(`CORS origin không được phép: ${origin}`));
     },
   };

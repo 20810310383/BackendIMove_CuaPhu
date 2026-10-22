@@ -51,7 +51,8 @@ async function loadAdminContext(db, userId, key) {
     const codes = Array.isArray(user.adminRoleCodes)
       ? user.adminRoleCodes
       : (Array.isArray(user.roleCodes) ? user.roleCodes : []);
-    const permissions = (!codes.length || codes.includes('SUPER_ADMIN'))
+    if (!codes.length) return null;
+    const permissions = (codes.includes('SUPER_ADMIN'))
       ? ['*']
       : [...new Set((await db.collection('admin_roles')
         .find({ code: { $in: codes }, status: 'ACTIVE' }, { maxTimeMS: 8_000 })

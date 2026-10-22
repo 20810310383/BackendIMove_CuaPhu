@@ -211,10 +211,17 @@ function createFundTopupRouter({getDb}){
       const db=getDb(), id=oid(req.params.id);
       if(!id)return res.status(400).json({message:'ID không hợp lệ.'});
       const row=await db.collection('fund_topup_requests').findOne({_id:id,actorUserId:req.auth.user._id});
-      if(!row)return res.status(404).json({message:'Không tìm thấy yêu cầu.'});
+      if(!row){
+        if(req.file)await fs.promises.unlink(path.join(receiptDir,path.basename(req.file.filename))).catch(()=>{});
+        return res.status(404).json({message:'Không tìm thấy yêu cầu.'});
+      }
       if(!req.file)return res.status(400).json({message:'Vui lòng chọn ảnh biên lai.'});
+      if(!['WAITING_TRANSFER','REJECTED'].includes(row.status)){
+        await fs.promises.unlink(path.join(receiptDir,path.basename(req.file.filename))).catch(()=>{});
+        return res.status(409).json({code:'TOPUP_RECEIPT_LOCKED',message:'Không thể tải lại biên lai khi yêu cầu đang chờ duyệt hoặc đã xử lý.'});
+      }
       const now=new Date();
-      await db.collection('fund_topup_requests').updateOne({_id:id},{
+      const updatedCount=await db.collection('fund_topup_requests').updateOne({_id:id,actorUserId:req.auth.user._id,status:row.status},{
         $set:{
           receiptStoredName:req.file.filename,
           receiptOriginalName:clean(req.file.originalname,240),
@@ -223,6 +230,11 @@ function createFundTopupRouter({getDb}){
           submittedAt:now,updatedAt:now,
         }
       });
+      if(updatedCount.matchedCount!==1){
+        await fs.promises.unlink(path.join(receiptDir,path.basename(req.file.filename))).catch(()=>{});
+        return res.status(409).json({code:'TOPUP_RECEIPT_LOCKED',message:'Trạng thái yêu cầu đã thay đổi.'});
+      }
+      if(row.receiptStoredName)await fs.promises.unlink(path.join(receiptDir,path.basename(row.receiptStoredName))).catch(()=>{});
       const updated=await db.collection('fund_topup_requests').findOne({_id:id});
       return res.json({request:serialize(updated)});
     }catch(e){return res.status(500).json({message:e.message});}
@@ -237,6 +249,7 @@ function createFundTopupRouter({getDb}){
       if(!id)return res.status(400).json({ok:false,message:'ID không hợp lệ.'});
       const row=await db.collection('fund_topup_requests').findOne({_id:id,actorUserId:req.auth.user._id});
       if(!row)return res.status(404).json({ok:false,message:'Không tìm thấy yêu cầu.'});
+      if(!['WAITING_TRANSFER','REJECTED'].includes(row.status))return res.status(409).json({ok:false,code:'TOPUP_RECEIPT_LOCKED',message:'Yêu cầu đã chốt hoặc đang chờ duyệt, không thể thay biên lai.'});
       const bytes=Buffer.isBuffer(req.body)?req.body:Buffer.alloc(0);
       if(!bytes.length)return res.status(400).json({ok:false,message:'File bill rỗng.'});
       if(bytes.length>2*1024*1024)return res.status(413).json({ok:false,message:'Ảnh bill quá lớn. Tối đa 2 MB.'});
@@ -245,7 +258,7 @@ function createFundTopupRouter({getDb}){
       storedName=`${Date.now()}-${crypto.randomBytes(8).toString('hex')}${ext}`;
       await fs.promises.writeFile(path.join(receiptDir,storedName),bytes);
       const now=new Date();
-      await db.collection('fund_topup_requests').updateOne({_id:id},{
+      const updatedCount=await db.collection('fund_topup_requests').updateOne({_id:id,actorUserId:req.auth.user._id,status:row.status},{
         $set:{
           receiptStoredName:storedName,
           receiptOriginalName:originalName,
@@ -253,6 +266,12 @@ function createFundTopupRouter({getDb}){
           status:'PENDING_REVIEW',submittedAt:now,updatedAt:now,
         }
       });
+      if(updatedCount.matchedCount!==1){
+        await fs.promises.unlink(path.join(receiptDir,path.basename(storedName))).catch(()=>{});
+        storedName='';
+        return res.status(409).json({ok:false,code:'TOPUP_RECEIPT_LOCKED',message:'Trạng thái yêu cầu đã thay đổi.'});
+      }
+      if(row.receiptStoredName)await fs.promises.unlink(path.join(receiptDir,path.basename(row.receiptStoredName))).catch(()=>{});
       const updated=await db.collection('fund_topup_requests').findOne({_id:id});
       return res.json({ok:true,request:serialize(updated)});
     }catch(e){
@@ -307,9 +326,12 @@ function createFundTopupAdminRouter({getDb}){
     if(status&&status!=='ALL')q.status=status;
     if(actorType&&actorType!=='ALL')q.actorType=actorType;
     const requestedLimit=Number(req.query.limit||100);
-    const limit=Math.max(1,Math.min(200,Number.isFinite(requestedLimit)?requestedLimit:100));
-    const rows=await getDb().collection('fund_topup_requests').find(q,{maxTimeMS:12000}).sort({createdAt:-1}).limit(limit).toArray();
-    return res.json({requests:rows.map(serialize),limit});
+    const limit=Math.max(1,Math.min(200,Number.isFinite(requestedLimit)?Math.floor(requestedLimit):100));
+    const requestedPage=Number(req.query.page||1);
+    const page=Math.max(1,Math.min(10000,Number.isFinite(requestedPage)?Math.floor(requestedPage):1));
+    const rows=await getDb().collection('fund_topup_requests').find(q,{maxTimeMS:12000})
+      .sort({createdAt:-1,_id:-1}).skip((page-1)*limit).limit(limit+1).toArray();
+    return res.json({requests:rows.slice(0,limit).map(serialize),limit,page,hasNext:rows.length>limit,hasPrevious:page>1});
   });
   r.get('/requests/:id/receipt',permit('settings.view'),async(req,res)=>{
     const id=oid(req.params.id);
@@ -327,6 +349,13 @@ function createFundTopupAdminRouter({getDb}){
     if(row.status==='APPROVED')return res.json({request:serialize(row),duplicate:true});
     if(!['PENDING_REVIEW','WAITING_TRANSFER'].includes(row.status))return res.status(409).json({message:'Trạng thái yêu cầu không thể duyệt.'});
     const now=new Date();
+    const claimed=await db.collection('fund_topup_requests').updateOne(
+      {_id:id,status:row.status},{$set:{status:'PROCESSING',processingAt:now,processingBy:req.admin._id,updatedAt:now}}
+    );
+    if(claimed.matchedCount!==1)return res.status(409).json({code:'TOPUP_ALREADY_PROCESSING',message:'Yêu cầu đang được xử lý ở phiên khác.'});
+    // PROCESSING is intentionally not automatically reverted on errors: the ledger may
+    // already have been written. Reconcile it before permitting another approval.
+    try {
     if(row.actorType==='DRIVER'){
       const points=Math.max(1,Math.floor(Number(row.amountVnd||0)/pointValueVnd()));
       await createAdminPointAdjustment(db,{
@@ -357,16 +386,23 @@ function createFundTopupAdminRouter({getDb}){
         {upsert:true},
       );
     }
-    await db.collection('fund_topup_requests').updateOne({_id:row._id},{$set:{status:'APPROVED',approvedAt:now,approvedBy:req.admin._id,updatedAt:now}});
+    await db.collection('fund_topup_requests').updateOne({_id:row._id,status:'PROCESSING',processingBy:req.admin._id},{$set:{status:'APPROVED',approvedAt:now,approvedBy:req.admin._id,updatedAt:now}});
     await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'FUND_TOPUP_APPROVE',entityType:'FUND_TOPUP',entityId:String(row._id),after:{actorType:row.actorType,amountVnd:row.amountVnd,requestCode:row.requestCode},createdAt:now});
     return res.json({request:serialize(await db.collection('fund_topup_requests').findOne({_id:row._id}))});
+    } catch (error) {
+      console.error('[FUND APPROVE NEEDS RECONCILIATION]',String(row._id),error);
+      // Do not automatically reset PROCESSING: financial action might have succeeded.
+      return res.status(503).json({code:'FUND_RECONCILIATION_REQUIRED',message:'Giao dịch cần đối soát thủ công trước khi xử lý tiếp.'});
+    }
   });
   r.post('/requests/:id/reject',permit('settings.manage'),async(req,res)=>{
     const db=getDb(),id=oid(req.params.id),now=new Date();
     const row=id?await db.collection('fund_topup_requests').findOne({_id:id}):null;
     if(!row)return res.status(404).json({message:'Không tìm thấy yêu cầu.'});
+    if(!['WAITING_TRANSFER','PENDING_REVIEW'].includes(row.status))return res.status(409).json({code:'TOPUP_FINALIZED',message:'Không thể từ chối yêu cầu đã duyệt hoặc đang xử lý.'});
     const reason=clean(req.body?.reason,500)||'Không đối chiếu được giao dịch.';
-    await db.collection('fund_topup_requests').updateOne({_id:id},{$set:{status:'REJECTED',rejectReason:reason,rejectedAt:now,rejectedBy:req.admin._id,updatedAt:now}});
+    const result=await db.collection('fund_topup_requests').updateOne({_id:id,status:row.status},{$set:{status:'REJECTED',rejectReason:reason,rejectedAt:now,rejectedBy:req.admin._id,updatedAt:now}});
+    if(result.matchedCount!==1)return res.status(409).json({code:'TOPUP_STATUS_CHANGED',message:'Trạng thái yêu cầu vừa thay đổi.'});
     return res.json({request:serialize(await db.collection('fund_topup_requests').findOne({_id:id}))});
   });
   return r;

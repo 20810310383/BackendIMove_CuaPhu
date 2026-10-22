@@ -156,7 +156,6 @@ function createMerchantRegistrationRouter({ getDb }) {
           address,
           description: '',
           status: 'PENDING',
-          approvalStatus: 'PENDING_REVIEW',
           commissionRate: 0,
           logoUrl: null,
           coverUrl: null,
