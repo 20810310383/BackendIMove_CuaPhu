@@ -11,26 +11,6 @@ function csv(name) {
     .filter(Boolean);
 }
 
-/**
- * CORS production chỉ cho phép origin công khai đã được khai báo.
- * Khi thử Flutter Web trực tiếp từ localhost, Admin có thể tạm mở đúng MỘT
- * origin cục bộ (http://localhost:PORT hoặc http://127.0.0.1:PORT).
- * Không cho wildcard, origin từ xa, file:// hoặc port không cố định.
- */
-function localWebTestOrigin() {
-  if (!bool('CORS_ENABLE_LOCAL_WEB_TEST', false)) return null;
-  const value = String(process.env.CORS_LOCAL_WEB_ORIGIN || '').trim();
-  if (!/^http:\/\/(?:localhost|127\.0\.0\.1):\d{1,5}$/.test(value)) return null;
-  try {
-    const parsed = new URL(value);
-    const port = Number(parsed.port);
-    if (port < 1 || port > 65535 || parsed.origin !== value) return null;
-    return value;
-  } catch (_) {
-    return null;
-  }
-}
-
 function assertProductionConfig() {
   const production = String(process.env.NODE_ENV || 'development').trim().toLowerCase() === 'production';
   if (!production) return { production: false };
@@ -77,9 +57,6 @@ function assertProductionConfig() {
   if (!bool('FORCE_HTTPS', true)) errors.push('FORCE_HTTPS production phải là true');
 
   const origins = csv('CORS_ORIGINS');
-  if (bool('CORS_ENABLE_LOCAL_WEB_TEST', false) && !localWebTestOrigin()) {
-    errors.push('CORS_LOCAL_WEB_ORIGIN không hợp lệ: chỉ cho phép http://localhost:PORT hoặc http://127.0.0.1:PORT');
-  }
   if (!origins.length) errors.push('CORS_ORIGINS production chưa được cấu hình');
   if (origins.some((origin) => origin === '*' || origin.startsWith('http://'))) {
     errors.push('CORS_ORIGINS production không được dùng * hoặc HTTP');
@@ -94,7 +71,7 @@ function assertProductionConfig() {
   return { production: true, redisRequired, fcmRequired, fcmEnabled };
 }
 
-function buildCorsOptions() {
+function buildCorsOptions({ isLocalTestOriginAllowed = null } = {}) {
   const production = String(process.env.NODE_ENV || 'development').trim().toLowerCase() === 'production';
 
   if (!production) {
@@ -102,14 +79,12 @@ function buildCorsOptions() {
   }
 
   const allowed = new Set(csv('CORS_ORIGINS'));
-  const testOrigin = localWebTestOrigin();
 
   return {
     credentials: true,
     origin(origin, callback) {
       if (!origin) return callback(null, true);
       if (allowed.has(origin)) return callback(null, true);
-      if (testOrigin && origin === testOrigin) return callback(null, true);
       try {
         const parsed = new URL(origin);
         const validOrigin = parsed.origin === origin && parsed.protocol === 'https:';
@@ -119,7 +94,18 @@ function buildCorsOptions() {
           return parsed.hostname.toLowerCase().endsWith('.'+suffix) && parsed.hostname.length>suffix.length+1 && !parsed.port;
         })) return callback(null, true);
       } catch (_) { /* malformed origin denied */ }
-      return callback(new Error(`CORS origin không được phép: ${origin}`));
+      // MongoDB-backed, permission-controlled, time-limited local browser test.
+      // Check ONLY loopback origins; every other unknown origin is rejected.
+      if (typeof isLocalTestOriginAllowed === 'function' &&
+          /^http:\/\/(?:localhost|127\.0\.0\.1):[0-9]{1,5}$/.test(origin)) {
+        Promise.resolve()
+          .then(() => isLocalTestOriginAllowed(origin))
+          .then((allowed) => callback(null, allowed === true))
+          .catch(() => callback(null, false));
+        return;
+      }
+      // Deny without throwing HTTP 500. Browser refuses to expose the response.
+      return callback(null, false);
     },
   };
 }
