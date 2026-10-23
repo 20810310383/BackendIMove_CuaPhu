@@ -107,6 +107,50 @@ function createBroadcastRouter({ getDb, getNotifications }) {
       .toArray();
   }
 
+  // Merchant notification/device tokens are bound to the MERCHANT user account
+  // (_id in users), NOT the merchant store id (_id in merchants).
+  // Merchant can be pending KYC and still needs to receive Admin broadcasts.
+  async function resolveMerchants(identifiers = null) {
+    const db = getDb();
+    const memberships = await db.collection('merchant_users')
+      .find({ status: 'ACTIVE' })
+      .project({ userId: 1, merchantId: 1 })
+      .limit(20000)
+      .toArray();
+    const memberRows = memberships.filter(row => row.userId && row.merchantId);
+    if (!memberRows.length) return [];
+
+    const uniqueUsers = [...new Map(memberRows.map(row => [String(row.userId), row.userId])).values()];
+    const uniqueMerchants = [...new Map(memberRows.map(row => [String(row.merchantId), row.merchantId])).values()];
+    const [users, merchants] = await Promise.all([
+      db.collection('users')
+        .find({ _id: { $in: uniqueUsers }, roles: 'MERCHANT', status: { $ne: 'BLOCKED' } })
+        .project({ _id: 1, phone: 1, email: 1, fullName: 1 })
+        .limit(20000).toArray(),
+      db.collection('merchants')
+        .find({ _id: { $in: uniqueMerchants } })
+        .project({ _id: 1, phone: 1, name: 1 })
+        .limit(20000).toArray(),
+    ]);
+
+    const userById = new Map(users.map(row => [String(row._id), row]));
+    const merchantById = new Map(merchants.map(row => [String(row._id), row]));
+    const selected = identifiers?.length ? new Set(identifiers.map(x => String(x).trim().toLowerCase())) : null;
+    const unique = new Map();
+    for (const membership of memberRows) {
+      const user = userById.get(String(membership.userId));
+      const merchant = merchantById.get(String(membership.merchantId));
+      // Exclude orphaned memberships and blocked users.
+      if (!user || !merchant) continue;
+      if (selected && ![
+        String(user._id), String(user.phone || ''), String(user.email || ''),
+        String(merchant._id), String(merchant.phone || ''),
+      ].some(value => selected.has(value.toLowerCase()))) continue;
+      unique.set(String(user._id), user);
+    }
+    return [...unique.values()];
+  }
+
   async function resolveRecipients({ audience, specificType, identifiers }) {
     const recipients = [];
 
@@ -129,6 +173,17 @@ function createBroadcastRouter({ getDb, getNotifications }) {
       for (const row of drivers) {
         recipients.push({ targetType: 'DRIVER', targetId: row._id, row });
       }
+    } else if (audience === 'MERCHANTS') {
+      for (const row of await resolveMerchants()) {
+        recipients.push({ targetType: 'MERCHANT', targetId: row._id, row });
+      }
+    } else if (audience === 'ALL') {
+      const [customers, drivers, merchants] = await Promise.all([
+        resolveCustomers(), resolveDrivers(), resolveMerchants(),
+      ]);
+      for (const row of customers) recipients.push({ targetType: 'CUSTOMER', targetId: row._id, row });
+      for (const row of drivers) recipients.push({ targetType: 'DRIVER', targetId: row._id, row });
+      for (const row of merchants) recipients.push({ targetType: 'MERCHANT', targetId: row._id, row });
     } else if (audience === 'ONLINE_DRIVERS') {
       for (const row of await resolveDrivers({ onlineOnly: true })) {
         recipients.push({ targetType: 'DRIVER', targetId: row._id, row });
@@ -137,15 +192,20 @@ function createBroadcastRouter({ getDb, getNotifications }) {
       const ids = parseIdentifiers(identifiers);
       if (!ids.length) return [];
 
-      if (specificType === 'CUSTOMER' || specificType === 'BOTH') {
+      if (['CUSTOMER', 'BOTH', 'ALL'].includes(specificType)) {
         for (const row of await resolveCustomers(ids)) {
           recipients.push({ targetType: 'CUSTOMER', targetId: row._id, row });
         }
       }
 
-      if (specificType === 'DRIVER' || specificType === 'BOTH') {
+      if (['DRIVER', 'BOTH', 'ALL'].includes(specificType)) {
         for (const row of await resolveDrivers({ identifiers: ids })) {
           recipients.push({ targetType: 'DRIVER', targetId: row._id, row });
+        }
+      }
+      if (['MERCHANT', 'ALL'].includes(specificType)) {
+        for (const row of await resolveMerchants(ids)) {
+          recipients.push({ targetType: 'MERCHANT', targetId: row._id, row });
         }
       }
     }
@@ -169,8 +229,8 @@ function createBroadcastRouter({ getDb, getNotifications }) {
     const deliveryMode = String(req.body?.deliveryMode || 'PUSH_AND_IN_APP').toUpperCase();
     if (title.length < 2 || body.length < 2) throw Object.assign(new Error('Tiêu đề và nội dung phải có tối thiểu 2 ký tự.'), { httpStatus: 400 });
     if (!Number.isInteger(level) || level < 1 || level > 4) throw Object.assign(new Error('Cấp thông báo không hợp lệ.'), { httpStatus: 400 });
-    if (!['CUSTOMERS','DRIVERS','BOTH','ONLINE_DRIVERS','SPECIFIC'].includes(audience)) throw Object.assign(new Error('Nhóm nhận không hợp lệ.'), { httpStatus: 400 });
-    if (audience === 'SPECIFIC' && (!identifiers.length || !['CUSTOMER','DRIVER','BOTH'].includes(specificType))) throw Object.assign(new Error('Cần cung cấp người nhận cụ thể và loại tài khoản.'), { httpStatus: 400 });
+    if (!['CUSTOMERS','DRIVERS','MERCHANTS','BOTH','ALL','ONLINE_DRIVERS','SPECIFIC'].includes(audience)) throw Object.assign(new Error('Nhóm nhận không hợp lệ.'), { httpStatus: 400 });
+    if (audience === 'SPECIFIC' && (!identifiers.length || !['CUSTOMER','DRIVER','MERCHANT','BOTH','ALL'].includes(specificType))) throw Object.assign(new Error('Cần cung cấp người nhận cụ thể và loại tài khoản.'), { httpStatus: 400 });
     if (!Number.isInteger(expiryHours) || expiryHours < 1 || expiryHours > 168) throw Object.assign(new Error('Thời gian hiệu lực không hợp lệ.'), { httpStatus: 400 });
     if (!['PUSH_AND_IN_APP','IN_APP_ONLY'].includes(deliveryMode)) throw Object.assign(new Error('Kênh thông báo không hợp lệ.'), { httpStatus: 400 });
     return { title, body, level, audience, specificType, identifiers, expiryHours, deliveryMode };
@@ -180,7 +240,7 @@ function createBroadcastRouter({ getDb, getNotifications }) {
     const active = new Set();
     const db = getDb();
     // Chunk $in queries to keep large broadcasts within MongoDB limits.
-    for (const targetType of ['CUSTOMER', 'DRIVER']) {
+    for (const targetType of ['CUSTOMER', 'DRIVER', 'MERCHANT']) {
       const ids = recipients.filter(x => x.targetType === targetType).map(x => x.targetId);
       for (let start = 0; start < ids.length; start += 400) {
         const rows = await db.collection('device_tokens').find({
@@ -206,14 +266,16 @@ function createBroadcastRouter({ getDb, getNotifications }) {
   router.get('/push-status', permit('broadcast.view'), async (_req, res) => {
     try {
       const db = getDb();
-      const [customerTokens, driverTokens] = await Promise.all([
+      const [customerTokens, driverTokens, merchantTokens] = await Promise.all([
         db.collection('device_tokens').countDocuments({ userType:'CUSTOMER', enabled:true }),
         db.collection('device_tokens').countDocuments({ userType:'DRIVER', enabled:true }),
+        db.collection('device_tokens').countDocuments({ userType:'MERCHANT', enabled:true }),
       ]);
       return res.json({
+        fcmEnabled: ['true', '1', 'yes', 'on'].includes(String(process.env.FCM_ENABLED || '').toLowerCase()),
         fcmConfigured: Boolean(getNotifications()?.isConfigured?.()),
-        activeTokens: { customers: customerTokens, drivers: driverTokens },
-        note: 'Số token đang bật không phải số thiết bị đã nhận push thành công.',
+        activeTokens: { customers: customerTokens, drivers: driverTokens, merchants: merchantTokens },
+        note: 'FCM initialized chỉ xác nhận SDK đã khởi tạo; để kiểm chứng thực tế cần gửi thử tới một thiết bị. Số token không phải số máy đã nhận.',
       });
     } catch (error) { return res.status(503).json({ message: error.message }); }
   });
@@ -360,7 +422,7 @@ function createBroadcastRouter({ getDb, getNotifications }) {
         return res.status(409).json({ code: 'FCM_NOT_CONFIGURED', message: 'FCM chưa được cấu hình trên Backend. Hãy bật FCM hoặc chọn Chỉ trong ứng dụng.' });
       }
       if (deliveryMode === 'PUSH_AND_IN_APP' && pushEligible === 0) {
-        return res.status(409).json({ code: 'NO_PUSH_TOKENS', message: 'Không có thiết bị User/Driver nào đăng ký token push hợp lệ cho nhóm nhận.' });
+        return res.status(409).json({ code: 'NO_PUSH_TOKENS', message: 'Không có thiết bị nào đăng ký token push cho nhóm người nhận đã chọn.' });
       }
 
       const now = new Date();
