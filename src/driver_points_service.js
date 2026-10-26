@@ -367,54 +367,67 @@ async function rejectTopupRequest(db, { topupId, adminId = null, reason = '' }) 
 
 
 async function createAdminPointAdjustment(db, {
-  driverId,
-  points,
-  reason,
-  reference = '',
-  adminId = null,
-  idempotencyKey,
+  driverId, points, reason, reference = '', adminId = null, idempotencyKey,
 }) {
   await ensureDriverPointIndexes(db);
-  const did = oid(driverId);
-  const aid = oid(adminId);
-  if (!did) throw new Error('Driver id không hợp lệ.');
-  const delta = Math.trunc(num(points));
-  if (!delta) throw new Error('Số điểm điều chỉnh phải khác 0.');
-  if (Math.abs(delta) > 1000000) throw new Error('Số điểm điều chỉnh vượt giới hạn cho phép.');
-  const why = clean(reason, 500);
-  if (why.length < 3) throw new Error('Vui lòng nhập lý do điều chỉnh.');
-  const idem = clean(idempotencyKey, 120);
-  if (!idem) throw new Error('Thiếu Idempotency-Key cho giao dịch điều chỉnh.');
-
-  const driver = await db.collection('drivers').findOne({ _id: did });
-  if (!driver) throw new Error('Không tìm thấy tài xế.');
-  const uid = oid(driver.userId);
-  const user = uid ? await db.collection('users').findOne({ _id: uid }, { projection: { fullName: 1, phone: 1 } }) : null;
-  const sourceTransactionId = `ADMIN_ADJUSTMENT:${idem}`;
-  const existing = await db.collection('driver_reward_transactions').findOne({ sourceTransactionId });
-  if (existing) {
-    const account = await recomputeDriverPointAccount(db, { driverId: did, userId: uid });
-    return { existing: true, transaction: existing, account, driver: { id: String(did), fullName: user?.fullName || driver.fullName || 'Tài xế', phone: user?.phone || driver.phone || '' } };
+  // A unique index is mandatory; failure must stop financial writes, not be swallowed.
+  await db.collection('driver_reward_transactions').createIndex(
+    { sourceTransactionId: 1 }, { unique: true, sparse: true, name: 'uq_driver_reward_source_tx' },
+  );
+  const did=oid(driverId), aid=oid(adminId);
+  if(!did || !aid)throw new Error('Driver ID hoặc Admin ID không hợp lệ.');
+  const delta=Math.trunc(num(points)), why=clean(reason,500), idem=clean(idempotencyKey,120);
+  if(!delta || Math.abs(delta)>1000000)throw new Error('Điểm điều chỉnh không hợp lệ.');
+  if(why.length<3)throw new Error('Yêu cầu ghi lý do điều chỉnh.');
+  if(!idem)throw new Error('Thiếu mã chống gửi trùng Idempotency-Key.');
+  const driver=await db.collection('drivers').findOne({_id:did});
+  if(!driver)throw new Error('Không tìm thấy tài xế.');
+  const uid=oid(driver.userId);
+  const user=uid?await db.collection('users').findOne({_id:uid},{projection:{fullName:1,phone:1}}):null;
+  const summary={id:String(did),fullName:user?.fullName||driver.fullName||'Tài xế',phone:user?.phone||driver.phone||''};
+  const sourceTransactionId=`ADMIN_ADJUSTMENT:${idem}`;
+  const existing=await db.collection('driver_reward_transactions').findOne({sourceTransactionId});
+  if(existing){
+    if(String(existing.driverId)!==String(did))throw new Error('Idempotency-Key đã được dùng cho tài xế khác.');
+    return {existing:true,transaction:existing,account:await db.collection('driver_reward_accounts').findOne({driverId:did}),driver:summary};
   }
-
-  const now = new Date();
-  const transaction = {
-    driverId: did,
-    ...(uid ? { userId: uid } : {}),
-    sourceTransactionId,
-    type: 'ADMIN_ADJUSTMENT',
-    points: delta,
-    amountVnd: Math.abs(delta) * pointValueVnd(),
-    direction: delta > 0 ? 'CREDIT' : 'DEBIT',
-    title: delta > 0 ? 'Admin cộng điểm tài xế' : 'Admin trừ điểm tài xế',
-    reason: why,
-    reference: clean(reference, 160) || null,
-    adminId: aid || adminId || null,
-    createdAt: now,
-  };
-  await db.collection('driver_reward_transactions').insertOne(transaction);
-  const account = await recomputeDriverPointAccount(db, { driverId: did, userId: uid });
-  return { existing: false, transaction, account, driver: { id: String(did), fullName: user?.fullName || driver.fullName || 'Tài xế', phone: user?.phone || driver.phone || '' } };
+  // Sync completed-booking fees before checking available balance.
+  // Future PLATFORM_FEE transactions still require independent debit guards.
+  await recomputeDriverPointAccount(db,{driverId:did,userId:uid});
+  const session=db.client?.startSession?.();
+  if(!session)throw new Error('MongoDB transactions chưa sẵn sàng. Không điều chỉnh điểm.');
+  let result;
+  try {
+    await session.withTransaction(async()=>{
+      const already=await db.collection('driver_reward_transactions').findOne({sourceTransactionId},{session});
+      if(already){
+        if(String(already.driverId)!==String(did))throw new Error('Idempotency-Key trùng tài xế khác.');
+        result={existing:true,transaction:already,account:await db.collection('driver_reward_accounts').findOne({driverId:did},{session}),driver:summary};
+        return;
+      }
+      const now=new Date();
+      const updated=await db.collection('driver_reward_accounts').findOneAndUpdate(
+        {driverId:did,...(delta<0?{balance:{$gte:-delta}}:{})},
+        {$inc:{balance:delta,...(delta>0?{lifetimeEarned:delta}:{lifetimeSpent:-delta})},$set:{updatedAt:now}},
+        {session,returnDocument:'after'},
+      );
+      const account=updated?._id?updated:updated?.value;
+      if(!account)throw new Error('Không đủ điểm để trừ; giao dịch đã bị hủy.');
+      const transaction={driverId:did,...(uid?{userId:uid}:{}),sourceTransactionId,type:'ADMIN_ADJUSTMENT',
+        points:delta,amountVnd:Math.abs(delta)*pointValueVnd(),direction:delta>0?'CREDIT':'DEBIT',
+        title:delta>0?'Admin cộng điểm tài xế':'Admin trừ điểm tài xế',reason:why,reference:clean(reference,160)||null,
+        adminId:aid,balanceAfter:account.balance,createdAt:now};
+      const out=await db.collection('driver_reward_transactions').insertOne(transaction,{session});
+      result={existing:false,transaction:{...transaction,_id:out.insertedId},account,driver:summary};
+    });
+    return result;
+  } catch(error) {
+    if(error.code===11000) {
+      const old=await db.collection('driver_reward_transactions').findOne({sourceTransactionId});
+      if(old && String(old.driverId)===String(did))return {existing:true,transaction:old,account:await db.collection('driver_reward_accounts').findOne({driverId:did}),driver:summary};
+    }
+    throw error;
+  } finally {await session.endSession();}
 }
 
 async function listAdminDriverPointAccounts(db, { keyword = '', limit = 300 } = {}) {

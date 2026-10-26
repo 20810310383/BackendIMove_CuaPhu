@@ -1,6 +1,7 @@
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const { ObjectId } = require('mongodb');
+const { createAdminGuard } = require('./admin_guard');
 const {
   pointValueVnd,
   minimumTopupVnd,
@@ -421,6 +422,7 @@ function createAdminAuth(getDb) {
 
 function createDriverExperienceAdminRouter({ getDb, getNotifications = null }) {
   const router = express.Router();
+  const pointWriteGuard = createAdminGuard({ getDb });
   router.use(createAdminAuth(getDb));
 
   router.get('/overview', async (_req, res) => {
@@ -534,7 +536,7 @@ function createDriverExperienceAdminRouter({ getDb, getNotifications = null }) {
     } catch (error) { return res.status(500).json({ message: error.message }); }
   });
 
-  router.post('/point-adjustments', async (req, res) => {
+  router.post('/point-adjustments', pointWriteGuard.requireAdmin, pointWriteGuard.permit('payments.manage'), async (req, res) => {
     try {
       const raw = Math.trunc(num(req.body?.points));
       const direction = clean(req.body?.direction || 'CREDIT', 20).toUpperCase();
@@ -635,14 +637,14 @@ function createDriverExperienceAdminRouter({ getDb, getNotifications = null }) {
     } catch (error) { return res.status(500).json({ message: error.message }); }
   });
 
-  router.post('/point-topups/:id/approve', async (req, res) => {
+  router.post('/point-topups/:id/approve', pointWriteGuard.requireAdmin, pointWriteGuard.permit('payments.manage'), async (req, res) => {
     try {
       const row = await approveTopupRequest(getDb(), { topupId: req.params.id, adminId: req.admin._id });
       return res.json({ ok: true, topup: serializeTopup(row) });
     } catch (error) { return res.status(400).json({ message: error.message }); }
   });
 
-  router.post('/point-topups/:id/reject', async (req, res) => {
+  router.post('/point-topups/:id/reject', pointWriteGuard.requireAdmin, pointWriteGuard.permit('payments.manage'), async (req, res) => {
     try {
       const row = await rejectTopupRequest(getDb(), {
         topupId: req.params.id,
