@@ -719,10 +719,10 @@ app.use('/api/v181/admin/banners', createAdBannerAdminRouter({ getDb:()=>db }));
 app.use('/api/v14/admin/analytics', createAnalyticsAdminRouter({ getDb:()=>db, getAnalytics:()=>analyticsService }));
 
 // V1.6 Multi-service Commerce + Merchant
-app.use('/api/v16/commerce', createCommercePublicRouter({ getDb:()=>db, requireCustomer, getPricing:()=>pricingService, getNotifications:()=>notificationService }));
-app.use('/api/v16/merchant', createMerchantRouter({ getDb:()=>db, getNotifications:()=>notificationService }));
+app.use('/api/v16/commerce', createCommercePublicRouter({ getDb:()=>db, requireCustomer, getPricing:()=>pricingService, getNotifications:()=>notificationService, getMatching:()=>matching }));
+app.use('/api/v16/merchant', createMerchantRouter({ getDb:()=>db, getNotifications:()=>notificationService, getMatching:()=>matching }));
 app.use('/api/v16/driver', createCommerceDriverRouter({ getDb:()=>db, requireApprovedDriver, findDriverByPhone, getNotifications:()=>notificationService }));
-app.use('/api/v16/admin/commerce', createCommerceAdminRouter({ getDb:()=>db, getNotifications:()=>notificationService }));
+app.use('/api/v16/admin/commerce', createCommerceAdminRouter({ getDb:()=>db, getNotifications:()=>notificationService, getMatching:()=>matching }));
 
 // V7.2 Driver Experience API
 app.use('/api/v72/driver', requireApprovedDriver, createDriverExperienceRouter({ getDb:()=>db, findDriverByPhone }));
@@ -992,6 +992,9 @@ app.get('/api/bookings/available', requireApprovedDriver, async (req, res) => {
       return res.status(403).json({ message: 'Tài xế đang OFFLINE.' });
     }
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
+    // Driver versions before V6.9 still poll the established endpoint.
+    const v69Offers = dispatchEngine ? await dispatchEngine.getAvailableOffers(found.driver._id) : [];
+    if (v69Offers.length) return res.json(v69Offers);
     return res.json(await matching.getAvailableOffers(found.driver._id));
   } catch (error) {
     return res.status(500).json({ message: error.message });
@@ -1007,6 +1010,16 @@ app.post('/api/bookings/:id/decline', requireApprovedDriver, async (req, res) =>
     if (!found && DEMO_RUNTIME_ENABLED && driverPhone === '0909000001') found = await ensureDemoDriver();
     if (!found) return res.status(404).json({ message: 'Không tìm thấy tài xế.' });
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
+
+    const v69Offer = dispatchEngine ? await dispatchEngine.activeOfferForDriver(found.driver._id) : null;
+    if (v69Offer && String(v69Offer.offer.bookingId) === String(id)) {
+      await dispatchEngine.declineOffer({
+        offerId: v69Offer.offer._id,
+        driverId: found.driver._id,
+        reason: String(req.body?.reason || 'DRIVER_NOT_INTERESTED'),
+      });
+      return res.json({ ok: true, message: 'Đã từ chối chuyến. Hệ thống sẽ chuyển cho tài xế khác.' });
+    }
 
     const booking = await db.collection('bookings').findOne({ _id: id, status: 'SEARCHING' });
     if (!booking) return res.status(409).json({ message: 'Chuyến không còn khả dụng.' });
@@ -1045,6 +1058,18 @@ app.post('/api/bookings/:id/accept', requireApprovedDriver, async (req, res) => 
       return res.status(403).json({ message: 'Tài xế chưa được duyệt đầy đủ KYC.' });
     }
     if (!matching) return res.status(503).json({ message: 'Matching Engine chưa sẵn sàng.' });
+
+    const v69Offer = dispatchEngine ? await dispatchEngine.activeOfferForDriver(found.driver._id) : null;
+    if (v69Offer && String(v69Offer.offer.bookingId) === String(id)) {
+      const doc = await dispatchEngine.acceptOffer({
+        offerId: v69Offer.offer._id,
+        driverId: found.driver._id,
+        userId: req.auth.user._id,
+        idempotencyKey: req.headers['idempotency-key'],
+      });
+      await addEvent(id, 'DRIVER_ACCEPTED', 'DRIVER', found.driver._id, { status: 'DRIVER_ASSIGNED', source: 'LEGACY_DRIVER_API' });
+      return res.json(doc);
+    }
 
     const validation = await matching.validateActiveOffer(id, found.driver._id);
     if (!validation.ok) return res.status(409).json({ message: validation.message });
@@ -1533,6 +1558,7 @@ dispatchEngine.start();
 commerceDispatchWorker = createCommerceDispatchWorker({
   getDb: () => db,
   getNotifications: () => notificationService,
+  getMatching: () => matching,
   intervalMs: Number(process.env.COMMERCE_DISPATCH_INTERVAL_MS || 10000),
 });
 commerceDispatchWorker.start();

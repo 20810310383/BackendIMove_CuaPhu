@@ -272,6 +272,17 @@ function driverCanHandleCommerce(driver, serviceCode) {
   return false;
 }
 
+function emitCommerceOrder(getMatching, driverId, order, action) {
+  // Mobile clients that have commerce support can update immediately through
+  // this socket event; polling the REST endpoints remains the source of truth.
+  try {
+    getMatching?.()?.emitToDriver?.(driverId, 'commerce:order', {
+      action,
+      order: serialize(order),
+    });
+  } catch (_) {}
+}
+
 async function eligibleCommerceDrivers(db, serviceCode, { onlineOnly = true } = {}) {
   const query = {
     approvalStatus: 'APPROVED',
@@ -315,7 +326,7 @@ async function eligibleCommerceDrivers(db, serviceCode, { onlineOnly = true } = 
   }).filter((d)=>d.pointBalance>=pointPolicy.blockBelow);
 }
 
-async function dispatchCommerceReady({ db, order, notificationService, actorType = 'SYSTEM', actorId = null }) {
+async function dispatchCommerceReady({ db, order, notificationService, getMatching, actorType = 'SYSTEM', actorId = null }) {
   if (!order) return { candidates: [] };
   const allowed = (['FOOD','ERRAND'].includes(order.serviceCode) && order.status === 'READY_FOR_PICKUP') ||
     (order.serviceCode === 'DELIVERY' && order.status === 'CREATED') ||
@@ -360,10 +371,11 @@ async function dispatchCommerceReady({ db, order, notificationService, actorType
       data: { orderId: String(order._id), status: order.status, serviceCode: order.serviceCode },
     }).catch(() => null)));
   }
+  if (getMatching) for (const driver of candidates) emitCommerceOrder(getMatching, driver._id, current || order, 'OFFERED');
   return { candidates };
 }
 
-async function assignCommerceDriver({ db, order, driverId, notificationService, actorType = 'ADMIN', actorId = null }) {
+async function assignCommerceDriver({ db, order, driverId, notificationService, getMatching, actorType = 'ADMIN', actorId = null }) {
   const driverObjectId = oid(driverId);
   if (!driverObjectId) throw new Error('Driver ID không hợp lệ.');
   const driver = await db.collection('drivers').findOne({ _id: driverObjectId });
@@ -409,10 +421,12 @@ async function assignCommerceDriver({ db, order, driverId, notificationService, 
       }).catch(()=>{});
     }
   }
-  return db.collection('orders').findOne({ _id: order._id });
+  const updatedOrder = await db.collection('orders').findOne({ _id: order._id });
+  emitCommerceOrder(getMatching, driver._id, updatedOrder, 'ASSIGNED');
+  return updatedOrder;
 }
 
-function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNotifications }) {
+function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNotifications, getMatching }) {
   const r = express.Router();
   r.get('/merchant-media/:merchantId/:filename', async (req,res) => {
     try {
@@ -551,7 +565,7 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
       }
       // DELIVERY does not wait for merchant approval: dispatch automatically as soon as the order exists.
       if(!merchantId && ['DELIVERY','ERRAND'].includes(serviceCode)){
-        setImmediate(()=>dispatchCommerceReady({db,order:doc,notificationService:getNotifications?getNotifications():null,actorType:'SYSTEM'}).catch((error)=>console.error('[COMMERCE AUTO DISPATCH]',error.message)));
+        setImmediate(()=>dispatchCommerceReady({db,order:doc,notificationService:getNotifications?getNotifications():null,getMatching,actorType:'SYSTEM'}).catch((error)=>console.error('[COMMERCE AUTO DISPATCH]',error.message)));
       }
       res.status(201).json({order:serialize(doc),autoDispatch:!merchantId});
     } catch(e){
@@ -573,7 +587,7 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
   return r;
 }
 
-function createMerchantRouter({ getDb, getNotifications }) {
+function createMerchantRouter({ getDb, getNotifications, getMatching }) {
   const r = express.Router();
   r.use(...createRequireMerchant(getDb));
   async function notifyMerchantMembers({ merchantId, title, body, data = {}, type = 'MERCHANT_ALERT', dedupeKeyPrefix = 'MERCHANT_ALERT' }) {
@@ -670,6 +684,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
         dispatchResult=await dispatchCommerceReady({
           db, order:updatedOrder,
           notificationService:getNotifications?getNotifications():null,
+          getMatching,
           actorType:'MERCHANT', actorId:req.auth.user._id,
         });
         await db.collection('audit_logs').insertOne({
@@ -830,7 +845,7 @@ function createCommerceDriverRouter({ getDb, requireApprovedDriver, findDriverBy
   return r;
 }
 
-function createCommerceAdminRouter({ getDb, getNotifications }) {
+function createCommerceAdminRouter({ getDb, getNotifications, getMatching }) {
   const r=express.Router();const {requireAdmin,permit}=createAdminGuard({getDb});r.use(requireAdmin);
   r.get('/delivery-policy',permit('orders.view'),async(_req,res)=>{try{res.json({policy:await getDeliveryPolicy(getDb())});}catch(e){res.status(500).json({message:e.message});}});
   r.put('/delivery-policy',permit('orders.policy.manage'),async(req,res)=>{try{const db=getDb(),now=new Date();const current=await getDeliveryPolicy(db);const policy={standard:normalizeFeeRule(req.body?.standard,current.standard),priority:normalizeFeeRule(req.body?.priority,current.priority),fragile:normalizeFeeRule(req.body?.fragile,current.fragile),cod:{enabled:Boolean(req.body?.cod?.enabled),requireKyc:req.body?.cod?.requireKyc!==false},updatedAt:now,updatedBy:req.admin._id};await db.collection('commerce_settings').updateOne({_id:'DELIVERY_FEE_POLICY'},{$set:policy},{upsert:true});await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'DELIVERY_POLICY_UPDATE',entityType:'COMMERCE_SETTING',entityId:'DELIVERY_FEE_POLICY',after:policy,createdAt:now});res.json({policy});}catch(e){res.status(400).json({message:e.message});}});
@@ -929,13 +944,13 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
       const db=getDb(),_id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Order ID không hợp lệ.'});
       const order=await db.collection('orders').findOne({_id});if(!order)return res.status(404).json({message:'Không tìm thấy đơn.'});
       if(req.body?.driverId){
-        const updated=await assignCommerceDriver({db,order,driverId:req.body.driverId,notificationService:getNotifications?getNotifications():null,actorType:'ADMIN',actorId:req.admin._id});
+        const updated=await assignCommerceDriver({db,order,driverId:req.body.driverId,notificationService:getNotifications?getNotifications():null,getMatching,actorType:'ADMIN',actorId:req.admin._id});
         await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'COMMERCE_ASSIGN_DRIVER',entityType:'ORDER',entityId:String(_id),after:{driverId:String(req.body.driverId)},createdAt:new Date()});
         return res.json({mode:'ASSIGNED',order:serialize(updated)});
       }
       const allowed=(['FOOD','ERRAND'].includes(order.serviceCode)&&order.status==='READY_FOR_PICKUP')||(order.serviceCode==='DELIVERY'&&order.status==='CREATED')||(order.serviceCode==='ERRAND'&&!order.merchantId&&order.status==='CREATED');
       if(!allowed)return res.status(409).json({message:`Đơn ${order.status} chưa sẵn sàng phát tài xế.`});
-      const result=await dispatchCommerceReady({db,order,notificationService:getNotifications?getNotifications():null,actorType:'ADMIN',actorId:req.admin._id});
+      const result=await dispatchCommerceReady({db,order,notificationService:getNotifications?getNotifications():null,getMatching,actorType:'ADMIN',actorId:req.admin._id});
       await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'COMMERCE_BROADCAST_DISPATCH',entityType:'ORDER',entityId:String(_id),after:{candidateCount:result.candidates.length},createdAt:new Date()});
       res.json({mode:'BROADCAST',candidateCount:result.candidates.length});
     }catch(e){res.status(400).json({message:e.message});}
@@ -944,7 +959,7 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
 }
 
 
-function createCommerceDispatchWorker({getDb,getNotifications,intervalMs=10000}){
+function createCommerceDispatchWorker({getDb,getNotifications,getMatching,intervalMs=10000}){
   let timer=null,busy=false;
   async function tick(){
     const db=getDb();if(!db||busy)return;busy=true;
@@ -955,7 +970,7 @@ function createCommerceDispatchWorker({getDb,getNotifications,intervalMs=10000})
         // A dispatch attempt already notified drivers. Re-broadcast no more
         // than once per minute unless Admin explicitly retries this order.
         if(order.dispatchStartedAt && Date.now()-new Date(order.dispatchStartedAt).getTime()<60000) continue;
-        await dispatchCommerceReady({db,order,notificationService:getNotifications?getNotifications():null,actorType:'SYSTEM'}).catch(()=>{});
+        await dispatchCommerceReady({db,order,notificationService:getNotifications?getNotifications():null,getMatching,actorType:'SYSTEM'}).catch(()=>{});
       }
     }finally{busy=false;}
   }

@@ -2012,6 +2012,7 @@ function createMatchingEngine({
     requeueAfterDriverCancel,
     onBookingTerminal,
     emitBookingUpdate,
+    emitToDriver,
     emitToUser,
     serializeBookingPublic,
     onDriverOffline,

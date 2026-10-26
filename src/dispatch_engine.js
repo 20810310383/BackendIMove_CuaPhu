@@ -54,6 +54,23 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     retryTimers.delete(key);
   }
 
+  function serializeDriverOffer(offer, booking) {
+    const expiresAt = new Date(offer.expiresAt);
+    const payload = serializeBooking(booking);
+    payload.offer = {
+      id: String(offer._id),
+      offerId: String(offer._id),
+      attemptNo: Number(offer.round || 1),
+      round: Number(offer.round || 1),
+      expiresAt: expiresAt.toISOString(),
+      secondsRemaining: Math.max(0, Math.ceil((expiresAt.getTime() - Date.now()) / 1000)),
+      distanceToPickupKm: offer.matchingSnapshot?.distanceKm ?? null,
+      matchingSource: 'V69_DISPATCH',
+      matchingScore: offer.matchingScore ?? null,
+    };
+    return payload;
+  }
+
   function scheduleRetry(bookingId, delaySeconds = 5, options = {}) {
     const key = String(bookingId);
     clearRetryTimer(bookingId);
@@ -224,6 +241,8 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       // app also polls /api/v69/driver/offers/active as a delivery fallback.
       try {
         getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: payload, round: nextRound, matchingScore: c.score });
+        // Legacy Driver builds still subscribe to this event until upgraded.
+        getMatching().emitToDriver(driverId, 'driver:offer', serializeDriverOffer(offer, booking));
         await db.collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.socketSent': true, updatedAt: new Date() } });
       } catch (e) {
         console.error('[V6.9 Dispatch socket]', e.message);
@@ -308,6 +327,13 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     const booking = await db.collection('bookings').findOne({ _id: offer.bookingId });
     if (!booking || !['SEARCHING', 'OFFERED'].includes(booking.status)) return null;
     return { offer, booking };
+  }
+
+  // Preserve the Driver app's established REST polling payload while V6.9
+  // remains the only engine allowed to claim offers.
+  async function getAvailableOffers(driverId) {
+    const active = await activeOfferForDriver(driverId);
+    return active ? [serializeDriverOffer(active.offer, active.booking)] : [];
   }
 
   async function addCooldown(driverId, bookingId, type, seconds, reason) {
@@ -521,6 +547,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       offer = { ...offer, status: 'PENDING', offeredAt: now, expiresAt, respondedAt: null, reason: null, manualAttempt };
     }
     getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: serializeBooking(booking), manual: true });
+    getMatching().emitToDriver(driverId, 'driver:offer', serializeDriverOffer(offer, booking));
     await notificationService.enqueue({ dedupeKey: `BOOKING_OFFER_MANUAL:${bookingId}:${driverId}:${version}:${offer.manualAttempt || 1}`, type: 'BOOKING_OFFER', targetType: 'DRIVER', targetId: driverId, bookingId, offerId: offer._id, title: 'Có chuyến được điều phối', body: 'Điều hành iMove vừa phát một chuyến cho bạn.', data: { bookingId, offerId: offer._id, dispatchVersion: version, expiresAt } });
     await getDb().collection('bookings').updateOne(
       { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
@@ -585,7 +612,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
   async function start() { if (started) return; started = true; sweepTimer = setInterval(() => sweepExpiredOffers().catch(e => console.error('[V6.9 Dispatch sweep]', e.message)), 1000); sweepTimer.unref?.(); }
   function close() { if (sweepTimer) clearInterval(sweepTimer); sweepTimer = null; for (const timer of retryTimers.values()) clearTimeout(timer); retryTimers.clear(); }
 
-  return { databaseReady, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, resumeSearchingBookings, activeOfferForDriver, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, diagnostics, start, close, addCooldown };
+  return { databaseReady, getConfig, saveConfig, dispatchBooking, dispatchWithRetry, resumeSearchingBookings, activeOfferForDriver, getAvailableOffers, declineOffer, acceptOffer, sweepExpiredOffers, cancelBooking, manualOffer, detail, diagnostics, start, close, addCooldown };
 }
 
 module.exports = { createDispatchEngine, DEFAULT_CONFIG, normalizeConfig };
