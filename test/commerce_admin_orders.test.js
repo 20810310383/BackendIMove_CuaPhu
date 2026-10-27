@@ -114,7 +114,7 @@ test('commerce indexes cover recent and status-filtered order feeds', async () =
   const calls = [];
   await ensureCommerceIndexes({
     collection(name) {
-      assert.equal(name, 'orders');
+      assert.ok(['orders','drivers'].includes(name));
       return { createIndex: async (keys, options) => calls.push({ keys, options }) };
     },
   });
@@ -122,6 +122,7 @@ test('commerce indexes cover recent and status-filtered order feeds', async () =
   assert.deepEqual(calls.map((call) => call.options.name), [
     'idx_commerce_orders_recent',
     'idx_commerce_orders_service_status_recent',
+    'idx_commerce_driver_roster_recent',
   ]);
 });
 
@@ -138,7 +139,7 @@ test('manual commerce dispatch returns a newly registered driver with their unav
       if (name === 'drivers') {
         return {
           find(query) {
-            assert.deepEqual(query, {});
+            assert.ok(Array.isArray(query.$or));
             return cursor([{
               _id: 'registered-driver',
               userId: 'registered-user',
@@ -158,7 +159,7 @@ test('manual commerce dispatch returns a newly registered driver with their unav
   };
 
   const res = response();
-  await commerceCandidatesHandler(db)({ params: { id: orderId } }, res);
+  await commerceCandidatesHandler(db)({ params: { id: orderId }, query: { q: 'Tài', limit: '50' } }, res);
 
   assert.equal(res.code, 200, JSON.stringify(res.body));
   assert.equal(res.body.drivers.length, 1);

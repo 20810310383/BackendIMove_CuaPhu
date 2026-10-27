@@ -34,6 +34,7 @@ const DEFAULT_DELIVERY_POLICY = {
   fragile: { mode:'FIXED', value:10000 },
   cod: { enabled:false, requireKyc:true },
 };
+let driverPointPolicyCache = { value: null, expiresAt: 0 };
 function normalizeFeeRule(value, fallback){
   const mode=String(value?.mode||fallback.mode||'FIXED').toUpperCase();
   return {mode:['FIXED','PERCENT'].includes(mode)?mode:'FIXED',value:Math.max(0,Number(value?.value??fallback.value??0)||0)};
@@ -42,11 +43,18 @@ function feeFromRule(base, rule){return rule.mode==='PERCENT'?Math.round(base*Nu
 function normalizePreference(value){const s=String(value||'STANDARD').trim().toUpperCase();return ['PRIORITY','ƯU TIÊN','UU TIEN'].includes(s)?'PRIORITY':'STANDARD';}
 function customerKycApproved(user){return ['APPROVED','VERIFIED','PASSED'].includes(String(user?.customerKycStatus||user?.kycStatus||user?.identityStatus||'').toUpperCase());}
 async function getDriverPointPolicy(db){
+  if (driverPointPolicyCache.value && driverPointPolicyCache.expiresAt > Date.now()) {
+    return driverPointPolicyCache.value;
+  }
   const policy=await db.collection('matching_policies').findOne({status:'ACTIVE'},{sort:{version:-1}}).catch(()=>null);
-  return {
+  const value = {
     blockBelow:Number(policy?.pointsPolicy?.blockBelow ?? 0),
     warnBelow:Number(policy?.pointsPolicy?.warnBelow ?? 20),
   };
+  // Point policy rarely changes. A brief cache keeps the dispatch picker
+  // responsive without materially delaying an admin policy update.
+  driverPointPolicyCache = { value, expiresAt: Date.now() + 10_000 };
+  return value;
 }
 async function getDriverPointBalance(db,driverId){
   const account=await db.collection('driver_reward_accounts').findOne({driverId});
@@ -100,6 +108,12 @@ async function ensureCommerceIndexes(db) {
     db.collection('orders').createIndex(
       { serviceCode: 1, status: 1, createdAt: -1 },
       { name: 'idx_commerce_orders_service_status_recent' },
+    ),
+    // Manual dispatch opens the newest registered driver accounts first.
+    // This avoids an in-memory sort of the full drivers collection.
+    db.collection('drivers').createIndex(
+      { createdAt: -1, _id: -1 },
+      { name: 'idx_commerce_driver_roster_recent' },
     ),
   ]).catch((error) => {
     console.warn('[COMMERCE INDEX]', error.message);
@@ -294,8 +308,13 @@ function commerceDispatchBlockReason(driver, serviceCode) {
   return null;
 }
 
+function escapeSearchRegex(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 async function decorateCommerceDrivers(db, drivers, serviceCode) {
   const safeDrivers = Array.isArray(drivers) ? drivers : [];
+  if (!safeDrivers.length) return [];
   const driverIds = safeDrivers.map((d) => d._id).filter(Boolean);
   const userIds = safeDrivers.map((d) => d.userId).filter(Boolean);
   const [users, accounts, pointPolicy] = await Promise.all([
@@ -353,12 +372,58 @@ async function eligibleCommerceDrivers(db, serviceCode, { onlineOnly = true } = 
 // register in the Driver app.  Eligibility remains enforced separately when
 // assigning the order; unavailable drivers are returned with a clear reason
 // instead of being silently omitted like they were before.
-async function getCommerceDispatchRoster(db, serviceCode) {
-  const drivers = await db.collection('drivers')
-    .find({})
-    .sort({ createdAt: -1, _id: -1 })
-    .limit(500)
-    .toArray();
+async function getCommerceDispatchRoster(db, serviceCode, { search = '', limit = 50 } = {}) {
+  const safeLimit = Math.max(1, Math.min(100, Number(limit) || 50));
+  const keyword = String(search || '').trim().slice(0, 80);
+  let query;
+  let sort = null;
+
+  if (keyword) {
+    const escapedKeyword = escapeSearchRegex(keyword);
+    const isPhone = /^\d{3,15}$/.test(keyword);
+    const namePattern = new RegExp(`^${escapedKeyword}`, 'i');
+    const phonePattern = isPhone ? keyword : new RegExp(`^${escapedKeyword}`, 'i');
+    const matchedUsers = await db.collection('users').find(
+      { $or: [{ fullName: namePattern }, { phone: phonePattern }] },
+      { projection: { _id: 1 } },
+    ).limit(safeLimit).toArray();
+    const terms = [
+      { fullName: namePattern },
+      { name: namePattern },
+      { phone: phonePattern },
+    ];
+    const userIds = matchedUsers.map((user) => user._id).filter(Boolean);
+    if (userIds.length) terms.push({ userId: { $in: userIds } });
+    const exactDriverId = oid(keyword);
+    if (exactDriverId) terms.push({ _id: exactDriverId });
+    query = { $or: terms };
+    sort = { createdAt: -1, _id: -1 };
+  } else {
+    // Opening the modal must be instant.  Use the matching eligibility index
+    // for the initial suggestions; the search box remains available for every
+    // registered account, including pending/offline drivers.
+    query = {
+      approvalStatus: 'APPROVED',
+      kycStatus: 'APPROVED',
+      onlineStatus: 'ONLINE',
+      $and: [
+        { $or: [{ activeBookingId: null }, { activeBookingId: { $exists: false } }] },
+        { $or: [{ activeCommerceOrderId: null }, { activeCommerceOrderId: { $exists: false } }] },
+      ],
+    };
+  }
+
+  const cursor = db.collection('drivers').find(query, {
+      projection: {
+        userId:1, fullName:1, name:1, phone:1,
+        approvalStatus:1, kycStatus:1, onlineStatus:1,
+        approvedServiceCodes:1, serviceCapabilities:1, servicePreferences:1,
+        activeBookingId:1, activeCommerceOrderId:1,
+        rating:1, completedTrips:1, createdAt:1,
+      },
+    });
+  if (sort) cursor.sort(sort);
+  const drivers = await cursor.limit(safeLimit).toArray();
   return decorateCommerceDrivers(db, drivers, serviceCode);
 }
 
@@ -990,7 +1055,9 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
     try{
       const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Order ID không hợp lệ.'});
       const order=await getDb().collection('orders').findOne({_id});if(!order)return res.status(404).json({message:'Không tìm thấy đơn.'});
-      const drivers=await getCommerceDispatchRoster(getDb(),order.serviceCode);
+      const requestedLimit=Number(req.query?.limit||50);
+      const limit=Math.max(1,Math.min(100,Number.isFinite(requestedLimit)?requestedLimit:50));
+      const drivers=await getCommerceDispatchRoster(getDb(),order.serviceCode,{search:req.query?.q,limit});
       res.json({order:serialize(order),drivers:drivers.map((d)=>({id:String(d._id),fullName:d.fullName,phone:d.phone,onlineStatus:d.onlineStatus||'OFFLINE',approvalStatus:d.approvalStatus||'PENDING',kycStatus:d.kycStatus||'INCOMPLETE',rating:Number(d.rating||0),completedTrips:Number(d.completedTrips||0),pointBalance:Number(d.pointBalance||0),pointStatus:d.pointStatus,pointWarning:d.pointWarning,dispatchable:!d.dispatchBlockReason,dispatchBlockReason:d.dispatchBlockReason,serviceCapabilities:normalizeCaps(d)}))});
     }catch(e){res.status(500).json({message:e.message});}
   });
