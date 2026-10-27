@@ -1384,6 +1384,13 @@ function createAuthRouter({
             approvalStatus:
               'PENDING',
 
+            // Keep the initial driver record consistent with the KYC flow.
+            // Without this field, accounts created from the app looked unlike
+            // accounts created by the back-office tools until their first KYC
+            // update, which made operations screens harder to reason about.
+            kycStatus:
+              'INCOMPLETE',
+
             onlineStatus:
               'OFFLINE',
 

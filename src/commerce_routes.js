@@ -272,6 +272,66 @@ function driverCanHandleCommerce(driver, serviceCode) {
   return false;
 }
 
+function commerceDispatchBlockReason(driver, serviceCode) {
+  if (String(driver?.approvalStatus || '').toUpperCase() !== 'APPROVED') {
+    return 'Tài khoản chưa được duyệt.';
+  }
+  if (String(driver?.kycStatus || '').toUpperCase() !== 'APPROVED') {
+    return 'Hồ sơ KYC chưa được duyệt.';
+  }
+  if (!driverCanHandleCommerce(driver, serviceCode)) {
+    return 'Chưa bật dịch vụ phù hợp với đơn này.';
+  }
+  if (driver?.activeBookingId || driver?.activeCommerceOrderId) {
+    return 'Tài xế đang có đơn.';
+  }
+  if (String(driver?.onlineStatus || '').toUpperCase() !== 'ONLINE') {
+    return 'Tài xế chưa ONLINE.';
+  }
+  if (driver?.pointStatus === 'BLOCKED') {
+    return driver.pointWarning || 'Tài xế đang bị chặn do số dư điểm.';
+  }
+  return null;
+}
+
+async function decorateCommerceDrivers(db, drivers, serviceCode) {
+  const safeDrivers = Array.isArray(drivers) ? drivers : [];
+  const driverIds = safeDrivers.map((d) => d._id).filter(Boolean);
+  const userIds = safeDrivers.map((d) => d.userId).filter(Boolean);
+  const [users, accounts, pointPolicy] = await Promise.all([
+    userIds.length
+      ? db.collection('users').find({ _id: { $in: userIds } }).project({ fullName:1, phone:1 }).toArray()
+      : [],
+    driverIds.length
+      ? db.collection('driver_reward_accounts').find({ driverId: { $in: driverIds } }).project({driverId:1,balance:1}).toArray()
+      : [],
+    getDriverPointPolicy(db),
+  ]);
+  const byUserId = new Map(users.map((u) => [String(u._id), u]));
+  const byDriverId = new Map(accounts.map((a) => [String(a.driverId), Number(a.balance || 0)]));
+
+  return safeDrivers.map((d) => {
+    const u = byUserId.get(String(d.userId)) || {};
+    const pointBalance=Number(byDriverId.get(String(d._id)) ?? 0);
+    const pointStatus = pointBalance < pointPolicy.blockBelow ? 'BLOCKED' : (pointBalance <= pointPolicy.warnBelow ? 'LOW' : 'OK');
+    const pointWarning = pointBalance < pointPolicy.blockBelow
+      ? `Số dư điểm ${pointBalance}. Tài xế cần nạp điểm trước khi nhận đơn.`
+      : (pointBalance <= pointPolicy.warnBelow ? `Số dư điểm còn ${pointBalance}. Nên nạp thêm điểm.` : null);
+    const decorated = {
+      ...d,
+      fullName: d.fullName || d.name || u.fullName || 'Tài xế',
+      phone: d.phone || u.phone || '',
+      pointBalance,
+      pointStatus,
+      pointWarning,
+    };
+    return {
+      ...decorated,
+      dispatchBlockReason: commerceDispatchBlockReason(decorated, serviceCode),
+    };
+  });
+}
+
 async function eligibleCommerceDrivers(db, serviceCode, { onlineOnly = true } = {}) {
   const query = {
     approvalStatus: 'APPROVED',
@@ -285,34 +345,21 @@ async function eligibleCommerceDrivers(db, serviceCode, { onlineOnly = true } = 
 
   const drivers = await db.collection('drivers').find(query).limit(500).toArray();
   const capable = drivers.filter((d) => driverCanHandleCommerce(d, serviceCode));
-  const driverIds = capable.map((d) => d._id).filter(Boolean);
-  const userIds = capable.map((d) => d.userId).filter(Boolean);
-  const [users, accounts, pointPolicy] = await Promise.all([
-    userIds.length
-      ? db.collection('users').find({ _id: { $in: userIds } }).project({ fullName:1, phone:1 }).toArray()
-      : [],
-    driverIds.length
-      ? db.collection('driver_reward_accounts').find({ driverId: { $in: driverIds } }).project({driverId:1,balance:1}).toArray()
-      : [],
-    getDriverPointPolicy(db),
-  ]);
-  const byUserId = new Map(users.map((u) => [String(u._id), u]));
-  const byDriverId = new Map(accounts.map((a) => [String(a.driverId), Number(a.balance || 0)]));
+  return (await decorateCommerceDrivers(db, capable, serviceCode))
+    .filter((d) => !d.dispatchBlockReason);
+}
 
-  return capable.map((d) => {
-    const u = byUserId.get(String(d.userId)) || {};
-    const pointBalance=Number(byDriverId.get(String(d._id)) ?? 0);
-    return {
-      ...d,
-      fullName: d.fullName || d.name || u.fullName || 'Tài xế',
-      phone: d.phone || u.phone || '',
-      pointBalance,
-      pointStatus: pointBalance < pointPolicy.blockBelow ? 'BLOCKED' : (pointBalance <= pointPolicy.warnBelow ? 'LOW' : 'OK'),
-      pointWarning: pointBalance < pointPolicy.blockBelow
-        ? `Số dư điểm ${pointBalance}. Tài xế cần nạp điểm trước khi nhận đơn.`
-        : (pointBalance <= pointPolicy.warnBelow ? `Số dư điểm còn ${pointBalance}. Nên nạp thêm điểm.` : null),
-    };
-  }).filter((d)=>d.pointBalance>=pointPolicy.blockBelow);
+// The manual dispatch picker must be able to find a driver as soon as they
+// register in the Driver app.  Eligibility remains enforced separately when
+// assigning the order; unavailable drivers are returned with a clear reason
+// instead of being silently omitted like they were before.
+async function getCommerceDispatchRoster(db, serviceCode) {
+  const drivers = await db.collection('drivers')
+    .find({})
+    .sort({ createdAt: -1, _id: -1 })
+    .limit(500)
+    .toArray();
+  return decorateCommerceDrivers(db, drivers, serviceCode);
 }
 
 async function dispatchCommerceReady({ db, order, notificationService, actorType = 'SYSTEM', actorId = null }) {
@@ -943,8 +990,8 @@ function createCommerceAdminRouter({ getDb, getNotifications }) {
     try{
       const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Order ID không hợp lệ.'});
       const order=await getDb().collection('orders').findOne({_id});if(!order)return res.status(404).json({message:'Không tìm thấy đơn.'});
-      const drivers=await eligibleCommerceDrivers(getDb(),order.serviceCode,{onlineOnly:true});
-      res.json({order:serialize(order),drivers:drivers.map((d)=>({id:String(d._id),fullName:d.fullName,phone:d.phone,onlineStatus:d.onlineStatus,rating:Number(d.rating||0),completedTrips:Number(d.completedTrips||0),pointBalance:Number(d.pointBalance||0),pointStatus:d.pointStatus,pointWarning:d.pointWarning,serviceCapabilities:normalizeCaps(d)}))});
+      const drivers=await getCommerceDispatchRoster(getDb(),order.serviceCode);
+      res.json({order:serialize(order),drivers:drivers.map((d)=>({id:String(d._id),fullName:d.fullName,phone:d.phone,onlineStatus:d.onlineStatus||'OFFLINE',approvalStatus:d.approvalStatus||'PENDING',kycStatus:d.kycStatus||'INCOMPLETE',rating:Number(d.rating||0),completedTrips:Number(d.completedTrips||0),pointBalance:Number(d.pointBalance||0),pointStatus:d.pointStatus,pointWarning:d.pointWarning,dispatchable:!d.dispatchBlockReason,dispatchBlockReason:d.dispatchBlockReason,serviceCapabilities:normalizeCaps(d)}))});
     }catch(e){res.status(500).json({message:e.message});}
   });
   // Explicit write permission; viewers cannot dispatch orders.

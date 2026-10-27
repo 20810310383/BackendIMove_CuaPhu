@@ -17,6 +17,12 @@ function adminOrdersHandler(db) {
   return layer.route.stack.at(-1).handle;
 }
 
+function commerceCandidatesHandler(db) {
+  const router = createCommerceAdminRouter({ getDb: () => db });
+  const layer = router.stack.find((item) => item.route?.path === '/orders/:id/candidates' && item.route.methods.get);
+  return layer.route.stack.at(-1).handle;
+}
+
 test('commerce admin feed only queries commerce services and clamps the result size', async () => {
   let query;
   let options;
@@ -117,4 +123,47 @@ test('commerce indexes cover recent and status-filtered order feeds', async () =
     'idx_commerce_orders_recent',
     'idx_commerce_orders_service_status_recent',
   ]);
+});
+
+test('manual commerce dispatch returns a newly registered driver with their unavailable reason', async () => {
+  const orderId = '507f1f77bcf86cd799439011';
+  const cursor = (rows) => ({
+    sort() { return this; },
+    limit() { return { toArray: async () => rows }; },
+    project() { return { toArray: async () => rows }; },
+  });
+  const db = {
+    collection(name) {
+      if (name === 'orders') return { findOne: async () => ({ _id: orderId, serviceCode: 'FOOD' }) };
+      if (name === 'drivers') {
+        return {
+          find(query) {
+            assert.deepEqual(query, {});
+            return cursor([{
+              _id: 'registered-driver',
+              userId: 'registered-user',
+              approvalStatus: 'PENDING',
+              kycStatus: 'INCOMPLETE',
+              onlineStatus: 'OFFLINE',
+              requestedServiceCodes: ['FOOD'],
+            }]);
+          },
+        };
+      }
+      if (name === 'users') return { find: () => cursor([{ _id: 'registered-user', fullName: 'Tài xế mới', phone: '0901000000' }]) };
+      if (name === 'driver_reward_accounts') return { find: () => cursor([]) };
+      if (name === 'matching_policies') return { findOne: async () => null };
+      throw new Error(`Unexpected collection: ${name}`);
+    },
+  };
+
+  const res = response();
+  await commerceCandidatesHandler(db)({ params: { id: orderId } }, res);
+
+  assert.equal(res.code, 200, JSON.stringify(res.body));
+  assert.equal(res.body.drivers.length, 1);
+  assert.equal(res.body.drivers[0].fullName, 'Tài xế mới');
+  assert.equal(res.body.drivers[0].phone, '0901000000');
+  assert.equal(res.body.drivers[0].dispatchable, false);
+  assert.match(res.body.drivers[0].dispatchBlockReason, /chưa được duyệt/i);
 });
