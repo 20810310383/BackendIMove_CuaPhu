@@ -352,9 +352,11 @@ function createNotificationService({ getDb }) {
         const critical = Number(outbox.level) === 1;
         const channelId = critical
           ? 'imove_critical'
-          : outbox.type === 'BOOKING_OFFER'
-              ? 'imove_trip_offers'
-              : 'imove_general';
+          : String(outbox.targetType || '').toUpperCase() === 'CUSTOMER'
+              ? 'imove_user_heads_up_v2'
+              : outbox.type === 'BOOKING_OFFER'
+                  ? 'imove_trip_offers'
+                  : 'imove_general';
 
         await messaging.send({
           token: item.token,

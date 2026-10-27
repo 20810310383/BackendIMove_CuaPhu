@@ -108,12 +108,40 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
         ? await db().collection('users').find({ _id: { $in: userIds } }).toArray()
         : [];
       const usersById = new Map(users.map((user) => [String(user._id), user]));
+      // Registered vehicles are stored separately from driver profiles.
+      // Batch lookup prevents N+1 queries and only exposes non-sensitive display fields.
+      const driverIds = rows.flatMap((driver) => lookupIdVariants(driver._id || driver.id));
+      const vehicles = driverIds.length
+        ? await db().collection('vehicles').find({ driverId: { $in: driverIds } })
+            .sort({ updatedAt: -1, _id: -1 }).toArray()
+        : [];
+      const vehiclesByDriver = new Map();
+      for (const vehicle of vehicles) {
+        const key = String(vehicle.driverId || '');
+        const existing = vehiclesByDriver.get(key);
+        const approved = ['APPROVED', 'ACTIVE'].includes(String(vehicle.status || '').toUpperCase());
+        if (!existing || (approved && !['APPROVED', 'ACTIVE'].includes(String(existing.status || '').toUpperCase()))) {
+          vehiclesByDriver.set(key, vehicle);
+        }
+      }
 
       return rows.map((driver) => {
         const user = usersById.get(String(driver.userId || ''));
         const profile = publicDriverProfile(user, driver);
+        const registeredVehicle = vehiclesByDriver.get(String(driver._id || driver.id)) || null;
+        const vehicle = registeredVehicle ? {
+          serviceCode: String(registeredVehicle.serviceCode || registeredVehicle.vehicleType || ''),
+          brand: String(registeredVehicle.brand || registeredVehicle.make || ''),
+          model: String(registeredVehicle.model || registeredVehicle.modelName || ''),
+          plateNumber: String(registeredVehicle.plateNumber || registeredVehicle.licensePlate || ''),
+          color: String(registeredVehicle.color || ''),
+          year: registeredVehicle.year || null,
+          status: String(registeredVehicle.status || ''),
+        } : null;
         return serializeDoc({
           ...driver,
+          vehicle,
+          registeredServiceCode: vehicle?.serviceCode || driver.serviceCode || '',
           user: profile,
           fullName: profile.fullName || driver.fullName || null,
           phone: profile.phone || driver.phone || null,
@@ -141,6 +169,8 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
         delete row.fullName;
         delete row.phone;
         delete row.email;
+        delete row.vehicle;
+        delete row.registeredServiceCode;
       }
       const candidate = String(row.id || row._id || new ObjectId().toString());
       keep.add(candidate);
