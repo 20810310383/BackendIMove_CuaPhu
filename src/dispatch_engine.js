@@ -153,7 +153,39 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     return true;
   }
 
-  async function dispatchBooking(rawBookingId, { reset = false, adminId = null } = {}) {
+  // MongoDB lease: ngăn hai worker PM2 / hai thao tác Admin phát đồng thời cùng booking.
+  // Lease có TTL để worker chết giữa chừng không khóa chuyến vĩnh viễn.
+  async function withBookingDispatchLease(rawBookingId, operation) {
+    const bookingId = oid(rawBookingId);
+    if (!bookingId) throw new Error('Booking id không hợp lệ.');
+    const token = crypto.randomUUID();
+    const now = new Date();
+    const leaseUntil = new Date(now.getTime() + 90000);
+    const claim = await getDb().collection('bookings').updateOne(
+      { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED', 'NO_DRIVER'] },
+        $or: [
+          { 'dispatchEngine.claimUntil': { $exists: false } },
+          { 'dispatchEngine.claimUntil': { $lte: now } },
+          { 'dispatchEngine.claimToken': null },
+        ] },
+      { $set: { 'dispatchEngine.claimToken': token, 'dispatchEngine.claimUntil': leaseUntil } },
+    );
+    if (!claim.modifiedCount) return { skipped: true, reason: 'DISPATCH_IN_PROGRESS_OR_BOOKING_TERMINAL' };
+    try {
+      return await operation(bookingId);
+    } finally {
+      await getDb().collection('bookings').updateOne(
+        { _id: bookingId, 'dispatchEngine.claimToken': token },
+        { $unset: { 'dispatchEngine.claimToken': '', 'dispatchEngine.claimUntil': '' } },
+      ).catch(error => console.error('[V6.9 Dispatch lease release]', error.message));
+    }
+  }
+
+  async function dispatchBooking(rawBookingId, options = {}) {
+    return withBookingDispatchLease(rawBookingId, bookingId => dispatchBookingUnlocked(bookingId, options));
+  }
+
+  async function dispatchBookingUnlocked(rawBookingId, { reset = false, adminId = null } = {}) {
     const db = getDb(); const bookingId = oid(rawBookingId); if (!bookingId) throw new Error('Booking id không hợp lệ.');
     let booking = await db.collection('bookings').findOne({ _id: bookingId });
     if (!booking) throw new Error('Không tìm thấy booking.');
@@ -166,6 +198,25 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       booking = await db.collection('bookings').findOne({ _id: bookingId });
     }
     if (!['SEARCHING', 'OFFERED'].includes(booking.status)) return { skipped: true, status: booking.status };
+    // Vòng WAITING còn hạn: sweep/REST/Admin không được phát thêm một vòng song song.
+    if (!reset && booking.dispatchEngine?.status === 'WAITING' &&
+        new Date(booking.dispatchEngine.roundExpiresAt || 0).getTime() > Date.now()) {
+      return { skipped: true, reason: 'ACTIVE_ROUND_WAITING',
+        round: Number(booking.dispatchEngine.currentRound || 0),
+        expiresAt: booking.dispatchEngine.roundExpiresAt };
+    }
+    // Retry chủ động phải thu hồi toàn bộ offer và vòng WAITING cũ trước khi tăng version.
+    if (reset && Number(booking.dispatchEngine?.version || 0) > 0) {
+      const now = new Date();
+      await db.collection('booking_offers_v69').updateMany(
+        { bookingId, status: 'PENDING' },
+        { $set: { status: 'CANCELLED', reason: 'DISPATCH_RESET', respondedAt: now, updatedAt: now } },
+      );
+      await db.collection('dispatch_rounds_v69').updateMany(
+        { bookingId, status: 'WAITING' },
+        { $set: { status: 'CANCELLED', reason: 'DISPATCH_RESET', completedAt: now } },
+      );
+    }
     const cfg = await getConfig();
     // Admin retry/manual actions are intentionally still available while auto
     // dispatch is paused. Customer-created bookings, however, must honour the
@@ -201,17 +252,37 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       return { waitingDriver: true, nextRetryAt };
     }
     const roundCfg = cfg.rounds[nextRound - 1];
-    const preview = await getMatching().previewCandidates(bookingId, { includeNoGps: Boolean(matchingPolicy?.allowNoGpsFallback) });
-    const previouslyOffered = new Set((await db.collection('booking_offers_v69').find({ bookingId, dispatchVersion }).project({ driverId: 1 }).toArray()).map(x => String(x.driverId)));
+    const preview = await getMatching().previewCandidates(bookingId, {
+      includeNoGps: Boolean(matchingPolicy?.allowNoGpsFallback),
+    });
+    const previouslyOffered = new Set((await db.collection('booking_offers_v69')
+      .find({ bookingId, dispatchVersion }).project({ driverId: 1 }).toArray())
+      .map(x => String(x.driverId)));
     const candidates = [];
-    for (const c of preview.candidates || []) {
-      if (c.pointsBlocked) continue;
-      if (c.distanceKm != null && Number(c.distanceKm) > roundCfg.radiusKm) continue;
-      if (previouslyOffered.has(String(c.driverId))) continue;
-      if (!(await eligibleCandidate(bookingId, c))) continue;
-      candidates.push(c);
+    const valid = (preview.candidates || []).filter(c =>
+      !c.pointsBlocked && c.driverId && !previouslyOffered.has(String(c.driverId)));
+    const gps = valid.filter(c => c.distanceKm != null && Number.isFinite(Number(c.distanceKm)) &&
+      Number(c.distanceKm) >= 0 && Number(c.distanceKm) <= roundCfg.radiusKm);
+    // Không trộn fallback với GPS trong một vòng; chỉ xét fallback khi hết ứng viên GPS.
+    for (const c of gps) {
+      if (await eligibleCandidate(bookingId, c)) candidates.push(c);
       if (candidates.length >= roundCfg.candidateCount) break;
     }
+    const gpsSelected = candidates.length;
+    if (!gpsSelected && matchingPolicy?.allowNoGpsFallback) {
+      // Fallback vẫn yêu cầu vị trí điểm đón hợp lệ; không phát chuyến khi chưa có tọa độ.
+      const pickup = booking.pickup?.location?.coordinates;
+      const pickupOk = Array.isArray(pickup) && pickup.length >= 2 &&
+        pickup.every(x => Number.isFinite(Number(x))) &&
+        !(Number(pickup[0]) === 0 && Number(pickup[1]) === 0);
+      if (pickupOk) {
+        for (const c of valid.filter(c => c.distanceKm == null)) {
+          if (await eligibleCandidate(bookingId, c)) candidates.push(c);
+          if (candidates.length >= roundCfg.candidateCount) break;
+        }
+      }
+    }
+    const candidateSource = gpsSelected ? 'GPS' : candidates.length ? 'NO_GPS_FALLBACK' : 'NONE';
     if (!candidates.length) {
       const delaySeconds = Math.max(2, Math.min(10, Number(cfg.retry?.retryDelaySeconds?.[0] || 3)));
       const nextRetryAt = new Date(Date.now() + delaySeconds * 1000);
@@ -220,13 +291,13 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
         { $set: { status: 'SEARCHING', 'dispatchEngine.version': dispatchVersion, 'dispatchEngine.currentRound': nextRound, 'dispatchEngine.status': 'WAITING_NEXT_ROUND', 'dispatchEngine.nextRetryAt': nextRetryAt, updatedAt: new Date() } },
       );
       if (!pendingChange.modifiedCount) return { skipped: true, reason: 'BOOKING_STATE_CHANGED' };
-      await event(bookingId, 'ROUND_EMPTY', { round: nextRound, dispatchVersion, candidatePreviewCount: Number(preview?.candidates?.length || 0), nextRetryAt });
+      await event(bookingId, 'ROUND_EMPTY', { round: nextRound, dispatchVersion, candidatePreviewCount: Number(preview?.candidates?.length || 0), candidateSource, nextRetryAt });
       scheduleRetry(bookingId, delaySeconds, { reset: false, adminId });
       return { waitingNextRound: true, round: nextRound, nextRetryAt };
     }
     clearRetryTimer(bookingId);
     const now = new Date(); const expiresAt = new Date(now.getTime() + roundCfg.timeoutSeconds * 1000);
-    await db.collection('dispatch_rounds_v69').updateOne({ bookingId, dispatchVersion, round: nextRound }, { $setOnInsert: { bookingId, dispatchVersion, round: nextRound, radiusKm: roundCfg.radiusKm, requestedCandidates: roundCfg.candidateCount, actualCandidates: candidates.length, status: 'WAITING', startedAt: now, expiresAt, createdAt: now } }, { upsert: true });
+    await db.collection('dispatch_rounds_v69').updateOne({ bookingId, dispatchVersion, round: nextRound }, { $setOnInsert: { bookingId, dispatchVersion, round: nextRound, radiusKm: roundCfg.radiusKm, requestedCandidates: roundCfg.candidateCount, actualCandidates: candidates.length, candidateSource, status: 'WAITING', startedAt: now, expiresAt, createdAt: now } }, { upsert: true });
     for (const c of candidates) {
       const driverId = oid(c.driverId); if (!driverId) continue;
       let offer;
@@ -258,9 +329,9 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
         ).catch(() => {});
       }
     }
-    await db.collection('bookings').updateOne({ _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } }, { $set: { status: 'OFFERED', dispatchEngine: { version: dispatchVersion, currentRound: nextRound, status: 'WAITING', roundExpiresAt: expiresAt, startedAt: booking.dispatchEngine?.startedAt || now, updatedAt: now }, updatedAt: now } });
-    await event(bookingId, 'ROUND_STARTED', { round: nextRound, dispatchVersion, candidateCount: candidates.length, expiresAt, adminId });
-    return { bookingId: String(bookingId), dispatchVersion, round: nextRound, candidates: candidates.length, expiresAt };
+    await db.collection('bookings').updateOne({ _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } }, { $set: { status: 'OFFERED', 'dispatchEngine.version': dispatchVersion, 'dispatchEngine.currentRound': nextRound, 'dispatchEngine.status': 'WAITING', 'dispatchEngine.roundExpiresAt': expiresAt, 'dispatchEngine.startedAt': booking.dispatchEngine?.startedAt || now, 'dispatchEngine.updatedAt': now, updatedAt: now } });
+    await event(bookingId, 'ROUND_STARTED', { round: nextRound, dispatchVersion, candidateCount: candidates.length, candidateSource, expiresAt, adminId });
+    return { bookingId: String(bookingId), dispatchVersion, round: nextRound, candidates: candidates.length, candidateSource, expiresAt };
   }
 
   async function dispatchWithRetry(rawBookingId, options = {}, attempt = 0) {
@@ -422,8 +493,18 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
   async function advanceAfterRound(bookingId, dispatchVersion, round, reason) {
     const db = getDb(); const booking = await db.collection('bookings').findOne({ _id: bookingId });
     if (!booking || !['SEARCHING', 'OFFERED'].includes(booking.status) || Number(booking.dispatchEngine?.version) !== Number(dispatchVersion)) return;
-    await db.collection('dispatch_rounds_v69').updateOne({ bookingId, dispatchVersion, round, status: 'WAITING' }, { $set: { status: 'TIMEOUT', completedAt: new Date(), reason } });
-    await db.collection('bookings').updateOne({ _id: bookingId }, { $set: { status: 'SEARCHING', 'dispatchEngine.status': 'NEXT_ROUND', updatedAt: new Date() } });
+    const closed = await db.collection('dispatch_rounds_v69').updateOne(
+      { bookingId, dispatchVersion, round, status: 'WAITING' },
+      { $set: { status: 'TIMEOUT', completedAt: new Date(), reason } },
+    );
+    if (!closed.modifiedCount) return; // Vòng đã hủy / xử lý ở worker khác.
+    const moved = await db.collection('bookings').updateOne(
+      { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] },
+        'dispatchEngine.version': dispatchVersion, 'dispatchEngine.currentRound': round,
+        'dispatchEngine.status': 'WAITING' },
+      { $set: { status: 'SEARCHING', 'dispatchEngine.status': 'NEXT_ROUND', updatedAt: new Date() } },
+    );
+    if (!moved.modifiedCount) return; // Admin vừa retry, không mở nhầm vòng cũ.
     await event(bookingId, 'ROUND_TIMEOUT', { dispatchVersion, round, reason });
     setImmediate(() => dispatchWithRetry(bookingId).catch(e => console.error('[V6.9 Dispatch next round]', e.message)));
   }
@@ -523,6 +604,11 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
   }
 
   async function manualOffer(rawBookingId, rawDriverId, adminId = null) {
+    return withBookingDispatchLease(rawBookingId, bookingId =>
+      manualOfferUnlocked(bookingId, rawDriverId, adminId));
+  }
+
+  async function manualOfferUnlocked(rawBookingId, rawDriverId, adminId = null) {
     const bookingId = oid(rawBookingId), driverId = oid(rawDriverId); if (!bookingId || !driverId) throw new Error('ID không hợp lệ.');
     let booking = await getDb().collection('bookings').findOne({ _id: bookingId }); if (!booking || booking.adminArchivedAt || !['SEARCHING', 'OFFERED', 'NO_DRIVER'].includes(booking.status)) throw new Error('Chuyến không còn ở trạng thái có thể điều phối.');
     if (booking.status === 'NO_DRIVER') {
@@ -530,6 +616,16 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       booking = await getDb().collection('bookings').findOne({ _id: bookingId });
     }
     const driver = await getDb().collection('drivers').findOne({ _id: driverId, onlineStatus: 'ONLINE', approvalStatus: 'APPROVED', kycStatus: 'APPROVED' }); if (!driver || driver.activeBookingId) throw new Error('Tài xế không sẵn sàng.');
+    const serviceCode = String(booking.serviceCode || 'BIKE').toUpperCase();
+    const vehicle = await getDb().collection('vehicles').findOne({
+      driverId, status: 'APPROVED',
+      $or: [{ serviceCodes: serviceCode }, { serviceCode }],
+    });
+    if (!vehicle) throw new Error('Xe tài xế chưa được duyệt cho loại dịch vụ này.');
+    const otherOffer = await getDb().collection('booking_offers_v69').findOne({
+      driverId, bookingId: { $ne: bookingId }, status: 'PENDING', expiresAt: { $gt: new Date() },
+    });
+    if (otherOffer) throw new Error('Tài xế đang có offer của chuyến khác.');
     const policy = await getMatching().getMatchingPolicy();
     const pointAccount = await getDb().collection('driver_reward_accounts').findOne({ driverId });
     const pointBalance = Number(pointAccount?.balance || 0);
@@ -593,7 +689,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       status: booking.status, serviceCode: booking.serviceCode, dispatch: booking.dispatchEngine || null,
       config: { enabled: cfg.enabled, maxRounds: cfg.maxRounds, currentRadiusKm: r?.radiusKm },
       matchingPolicy: { autoDispatchEnabled: policy.autoDispatchEnabled, maxRadiusKm: policy.maxRadiusKm, allowNoGpsFallback: policy.allowNoGpsFallback, locationFreshSeconds: policy.locationFreshSeconds },
-      statistics: { onlineDrivers, approvedOnlineDrivers: readyDrivers, locationRecords: locationCount, freshLocationRecords90s: freshLocationCount, gpsCandidates: candidates.length, eligibleNearby: nearby.length, pendingOffers: activeOffers },
+      statistics: { onlineDrivers, approvedOnlineDrivers: readyDrivers, locationRecords: locationCount, freshLocationRecords90s: freshLocationCount, gpsCandidates: candidates.filter(c => c.distanceKm != null).length, noGpsCandidates: candidates.filter(c => c.distanceKm == null).length, eligibleNearby: nearby.length, pendingOffers: activeOffers },
       previewError, reasons, lastError: booking.dispatchEngine?.lastError || null,
     };
   }

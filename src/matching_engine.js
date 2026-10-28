@@ -1147,7 +1147,7 @@ function createMatchingEngine({
           pointsLow: Boolean(candidate.pointsLow),
           pointStatus: candidate.pointStatus || 'OK',
           pointWarning: candidate.pointWarning || null,
-          distanceKm: Number.isFinite(Number(candidate.distanceKm)) ? Number(candidate.distanceKm) : null,
+          distanceKm: candidate.distanceKm != null && Number.isFinite(Number(candidate.distanceKm)) ? Number(candidate.distanceKm) : null,
           source: candidate.source,
           score: Number(candidate.matchingScore || 0),
           rank: Number(candidate.matchingRank || 0),

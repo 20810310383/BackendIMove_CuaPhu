@@ -249,7 +249,7 @@ async function loadRecentTripStats(db, driverIds, policy) {
 
 function normalizeScoreParts(candidate, policy, maxima) {
   const driver = candidate.driver || {};
-  const distance = Number(candidate.distanceKm);
+  const distance = candidate.distanceKm == null ? NaN : Number(candidate.distanceKm);
   const distanceScore = Number.isFinite(distance)
     ? Math.max(0, 100 * (1 - Math.min(distance, policy.maxRadiusKm) / policy.maxRadiusKm))
     : 0;
@@ -352,9 +352,13 @@ async function rankMatchingCandidates({ db, candidates, policy }) {
       matchingPriority: activePriority ? priority : 0,
     };
   }).sort((a, b) => {
+    // Không coi tài xế thiếu GPS là tài xế gần nhất, kể cả khi điểm xếp hạng cao.
+    const aHasGps = a.distanceKm != null && Number.isFinite(Number(a.distanceKm));
+    const bHasGps = b.distanceKm != null && Number.isFinite(Number(b.distanceKm));
+    if (aHasGps !== bHasGps) return aHasGps ? -1 : 1;
     if (b.matchingScore !== a.matchingScore) return b.matchingScore - a.matchingScore;
-    const da = Number.isFinite(Number(a.distanceKm)) ? Number(a.distanceKm) : Infinity;
-    const dbb = Number.isFinite(Number(b.distanceKm)) ? Number(b.distanceKm) : Infinity;
+    const da = a.distanceKm != null && Number.isFinite(Number(a.distanceKm)) ? Number(a.distanceKm) : Infinity;
+    const dbb = b.distanceKm != null && Number.isFinite(Number(b.distanceKm)) ? Number(b.distanceKm) : Infinity;
     if (da !== dbb) return da - dbb;
     return Number(b.driver?.rating || 0) - Number(a.driver?.rating || 0);
   }).map((candidate, index) => ({ ...candidate, matchingRank: index + 1 }));
