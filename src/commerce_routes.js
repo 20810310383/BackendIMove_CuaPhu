@@ -568,7 +568,18 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
         const baseFee=Number(fare.customerTotal||fare.total||0);
         const extra=await priceDeliveryExtras({db:getDb(),baseFee,details:req.body?.deliveryDetails,user:req.auth.user});
         fare={...fare,customerTotal:extra.total,total:extra.total,deliveryExtra:{preference:extra.preference,preferenceSurcharge:extra.preferenceSurcharge,fragileSurcharge:extra.fragileSurcharge,codAmount:extra.codAmount},breakdown:{...(fare.breakdown||{}),baseDeliveryFee:baseFee,preferenceSurcharge:extra.preferenceSurcharge,fragileSurcharge:extra.fragileSurcharge}};
-        deliveryPolicy={codAllowed:extra.policy.cod.enabled&&(!extra.policy.cod.requireKyc||customerKycApproved(req.auth.user)),codEnabled:extra.policy.cod.enabled,requireKyc:extra.policy.cod.requireKyc};
+        // Cùng một cước nền được dùng để hiển thị cả hai lựa chọn trên User.
+        // Tính ở máy chủ để không lộ logic định giá cho client tự quyết định.
+        const fragileFee=extra.fragileSurcharge;
+        deliveryPolicy={
+          codAllowed:extra.policy.cod.enabled&&(!extra.policy.cod.requireKyc||customerKycApproved(req.auth.user)),
+          codEnabled:extra.policy.cod.enabled,
+          requireKyc:extra.policy.cod.requireKyc,
+          feeOptions:{
+            STANDARD:Math.max(0,Math.round(baseFee+feeFromRule(baseFee,extra.policy.standard)+fragileFee)),
+            PRIORITY:Math.max(0,Math.round(baseFee+feeFromRule(baseFee,extra.policy.priority)+fragileFee)),
+          },
+        };
       }
       res.json({ fare, deliveryPolicy });
     } catch(e){res.status(e.httpStatus||400).json({code:e.code||null,message:e.message});}
