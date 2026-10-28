@@ -18,6 +18,31 @@ function normalizeNotificationLevel(value) {
   return Math.min(4, Math.max(1, level));
 }
 
+// Phân kênh theo SỰ KIỆN + vai trò; Android bắt buộc tạo các channel ID này
+// trong Driver/Merchant trước khi FCM hiển thị, đặc biệt khi app bị khóa màn hình.
+function notificationAndroidChannel(outbox) {
+  const role = String(outbox.targetType || '').toUpperCase();
+  const type = String(outbox.type || '').toUpperCase();
+  if (role === 'DRIVER' && ['BOOKING_OFFER', 'COMMERCE_ORDER'].includes(type))
+    return { id: 'imove_driver_orders_v1', sound: 'imove_new_order', isOrder: true };
+  if (role === 'MERCHANT' && type === 'MERCHANT_ORDER_NEW')
+    return { id: 'imove_merchant_orders_v1', sound: 'imove_new_order', isOrder: true };
+  if (Number(outbox.level) === 1)
+    return { id: 'imove_critical_v2', sound: 'default', isOrder: false };
+  if (role === 'CUSTOMER')
+    return { id: 'imove_user_heads_up_v2', sound: 'default', isOrder: false };
+  return { id: 'imove_general_v2', sound: 'default', isOrder: false };
+}
+
+// FCM yêu cầu mọi giá trị data phải là string; ObjectId/Date/object cần convert.
+function notificationFcmData(data) {
+  return Object.fromEntries(Object.entries(data || {}).map(([key, value]) => [
+    key,
+    value == null ? '' : typeof value === 'string' ? value :
+      typeof value === 'object' ? JSON.stringify(value) : String(value),
+  ]));
+}
+
 function createNotificationService({ getDb }) {
   let admin = null;
   let messaging = null;
@@ -349,14 +374,7 @@ function createNotificationService({ getDb }) {
 
     for (const item of tokens) {
       try {
-        const critical = Number(outbox.level) === 1;
-        const channelId = critical
-          ? 'imove_critical'
-          : String(outbox.targetType || '').toUpperCase() === 'CUSTOMER'
-              ? 'imove_user_heads_up_v2'
-              : outbox.type === 'BOOKING_OFFER'
-                  ? 'imove_trip_offers'
-                  : 'imove_general';
+        const channel = notificationAndroidChannel(outbox);
 
         await messaging.send({
           token: item.token,
@@ -365,17 +383,17 @@ function createNotificationService({ getDb }) {
             body: outbox.body,
           },
           data: {
-            ...outbox.data,
+            ...notificationFcmData(outbox.data),
             notificationId: String(outbox._id),
             type: outbox.type,
           },
           android: {
             priority: 'high',
             notification: {
-              channelId,
-              sound: 'default',
+              channelId: channel.id,
+              sound: channel.sound,
               defaultVibrateTimings: true,
-              visibility: 'public',
+              visibility: 'private',
             },
           },
           apns: {
