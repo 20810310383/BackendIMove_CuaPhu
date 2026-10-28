@@ -524,7 +524,33 @@ app.post('/api/v69/driver/offers/:offerId/decline', requireApprovedDriver, async
   catch(e){return res.status(e.code==='OFFER_NOT_ACTIVE'?409:500).json({code:e.code||null,message:e.message});}
 });
 app.post('/api/v69/driver/heartbeat', requireApprovedDriver, async (req, res) => {
-  try { const found=await findDriverByPhone(req.auth.user.phone); if(!found)return res.status(404).json({message:'Không tìm thấy tài xế.'}); const nowDate=new Date(); const lat=Number(req.body?.lat),lng=Number(req.body?.lng); await db.collection('drivers').updateOne({_id:found.driver._id},{$set:{lastHeartbeatAt:nowDate,updatedAt:nowDate}}); if(Number.isFinite(lat)&&Number.isFinite(lng)) { await db.collection('driver_locations').updateOne({driverId:found.driver._id},{$set:{driverId:found.driver._id,location:{type:'Point',coordinates:[lng,lat]},heading:Number(req.body?.heading||0),speed:Number(req.body?.speed||0),updatedAt:nowDate},$setOnInsert:{createdAt:nowDate}},{upsert:true}); if(trustService) await trustService.analyzeLocation({driverId:found.driver._id,userId:found.user._id,lat,lng,isMocked:Boolean(req.body?.isMocked),accuracy:req.body?.accuracy,timestamp:req.body?.timestamp}); } return res.json({ok:true,serverTime:nowDate}); } catch(e){return res.status(500).json({message:e.message});}
+  try {
+    const found = await findDriverByPhone(req.auth.user.phone);
+    if (!found) return res.status(404).json({ message: 'Không tìm thấy tài xế.' });
+    const { parseDriverHeartbeatLocation } = require('./driver_heartbeat_payload');
+    const gps = parseDriverHeartbeatLocation(req.body || {});
+    const nowDate = new Date();
+    await db.collection('drivers').updateOne(
+      { _id: found.driver._id },
+      { $set: { lastHeartbeatAt: nowDate, updatedAt: nowDate } },
+    );
+    if (gps.hasCoordinates) {
+      // Use the same GPS writer as /api/drivers/location: TTL, server timestamp,
+      // online/KYC guards and geospatial shape are now identical.
+      await matching.updateLocationByContext(req.driverContext || {
+        driver: found.driver, user: found.user,
+      }, gps);
+      if (trustService) {
+        try {
+          await trustService.analyzeLocation({ driverId: found.driver._id, userId: found.user._id,
+            lat: gps.latitude, lng: gps.longitude, isMocked: Boolean(req.body?.isMocked),
+            accuracy: gps.accuracyM, timestamp: req.body?.timestamp });
+        } catch (e) { console.warn('[Driver heartbeat trust]', e.message); }
+      }
+    }
+    return res.json({ ok: true, serverTime: nowDate, locationUpdated: gps.hasCoordinates,
+      locationReason: gps.hasCoordinates ? null : gps.reason });
+  } catch (e) { return res.status(500).json({ message: e.message }); }
 });
 app.get('/api/v69/driver/notifications', requireApprovedDriver, async (req,res)=>{const found=await findDriverByPhone(req.auth.user.phone);if(!found)return res.status(404).json({message:'Không tìm thấy tài xế.'});return res.json(await notificationService.listNotifications(found.driver._id,req.query.limit));});
 app.get('/api/v69/customer/notifications', requireCustomer, async (req,res)=>res.json(await notificationService.listNotifications(req.auth.user._id,req.query.limit)));

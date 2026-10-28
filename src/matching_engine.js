@@ -562,10 +562,33 @@ function createMatchingEngine({
           },
         },
         updatedAt: { $gte: freshCutoff },
-      }).limit(policy.maxCandidates).toArray();
+      }).limit(Math.min(1000, Math.max(100, policy.maxCandidates * 5))).toArray();
     } catch (error) {
-      console.warn('[Matching] Geo query failed:', error.message);
-      return [];
+      // Fail closed on geo-coordinate validity, but don't silently discard all
+      // fresh nearby drivers when a 2dsphere index is unavailable during repair.
+      console.warn('[Matching] Geo query failed; using bounded distance scan:', error.message);
+      try {
+        const fresh = await db.collection('driver_locations').find({
+          updatedAt: { $gte: freshCutoff },
+          'location.type': 'Point',
+        }).limit(3000).toArray();
+        locations = fresh.filter((item) => {
+          const xy = item?.location?.coordinates;
+          if (!Array.isArray(xy) || xy.length < 2) return false;
+          const lon = Number(xy[0]), lat = Number(xy[1]);
+          return Number.isFinite(lat) && Number.isFinite(lon) &&
+            lat >= -90 && lat <= 90 && lon >= -180 && lon <= 180 &&
+            !(lat === 0 && lon === 0) &&
+            haversineKm(pickupLat, pickupLon, lat, lon) * 1000 <= maxDistanceM;
+        }).sort((a, b) => {
+          const aa = a.location.coordinates, bb = b.location.coordinates;
+          return haversineKm(pickupLat, pickupLon, Number(aa[1]), Number(aa[0])) -
+            haversineKm(pickupLat, pickupLon, Number(bb[1]), Number(bb[0]));
+        }).slice(0, Math.min(1000, policy.maxCandidates));
+      } catch (scanError) {
+        console.error('[Matching] Geo fallback scan failed:', scanError.message);
+        return [];
+      }
     }
 
     const candidates = [];

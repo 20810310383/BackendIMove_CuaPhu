@@ -642,9 +642,22 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       await getDb().collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { status: 'PENDING', offeredAt: now, expiresAt, respondedAt: null, reason: null, manualAttempt, updatedAt: now } });
       offer = { ...offer, status: 'PENDING', offeredAt: now, expiresAt, respondedAt: null, reason: null, manualAttempt };
     }
-    getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: serializeBooking(booking), manual: true });
-    getMatching().emitToDriver(driverId, 'driver:offer', serializeDriverOffer(offer, booking));
-    await notificationService.enqueue({ dedupeKey: `BOOKING_OFFER_MANUAL:${bookingId}:${driverId}:${version}:${offer.manualAttempt || 1}`, type: 'BOOKING_OFFER', targetType: 'DRIVER', targetId: driverId, bookingId, offerId: offer._id, title: 'Có chuyến được điều phối', body: 'Điều hành iMove vừa phát một chuyến cho bạn.', data: { bookingId, offerId: offer._id, dispatchVersion: version, expiresAt } });
+    // Manual and automatic offers share the same durable offer-delivery contract.
+    // Socket/FCM failure must not orphan a valid PENDING manual offer.
+    try {
+      getMatching().emitToDriver(driverId, 'v69:booking_offer', { offerId: String(offer._id), expiresAt: expiresAt.toISOString(), booking: serializeBooking(booking), manual: true });
+      getMatching().emitToDriver(driverId, 'driver:offer', serializeDriverOffer(offer, booking));
+      await getDb().collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.socketSent': true } });
+    } catch (error) {
+      console.error('[V6.9 Manual dispatch socket]', error.message);
+    }
+    try {
+      await notificationService.enqueue({ dedupeKey: `BOOKING_OFFER_MANUAL:${bookingId}:${driverId}:${version}:${offer.manualAttempt || 1}`, type: 'BOOKING_OFFER', targetType: 'DRIVER', targetId: driverId, bookingId, offerId: offer._id, title: 'Có chuyến được điều phối', body: 'Điều hành iMove vừa phát một chuyến cho bạn.', data: { bookingId, offerId: offer._id, dispatchVersion: version, expiresAt } });
+      await getDb().collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.fcmQueued': true } });
+    } catch (error) {
+      console.error('[V6.9 Manual dispatch notification]', error.message);
+      await getDb().collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.lastError': String(error.message).slice(0, 350) } }).catch(() => {});
+    }
     await getDb().collection('bookings').updateOne(
       { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
       { $set: { status: 'OFFERED', 'dispatchEngine.status': 'WAITING', 'dispatchEngine.roundExpiresAt': expiresAt, updatedAt: new Date() } },
@@ -675,6 +688,53 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     const unblocked = candidates.filter(c => !c.pointsBlocked);
     const nearby = unblocked.filter(c => c.distanceKm != null && Number(c.distanceKm) <= Number(r?.radiusKm || 2));
     const reasons = [];
+    const serviceCode = String(booking.serviceCode || 'BIKE').toUpperCase();
+    const pickupXY = booking.pickup?.location?.coordinates;
+    const pickupValid = Array.isArray(pickupXY) && pickupXY.length >= 2 &&
+      Number.isFinite(Number(pickupXY[0])) && Number.isFinite(Number(pickupXY[1])) &&
+      !(Number(pickupXY[0]) === 0 && Number(pickupXY[1]) === 0);
+    const now = new Date();
+    const onlineReady = await db.collection('drivers').find({
+      onlineStatus: 'ONLINE', approvalStatus: 'APPROVED', kycStatus: 'APPROVED',
+    }).limit(40).toArray();
+    const perDriver = await Promise.all(onlineReady.map(async (driver) => {
+      const driverId = driver._id;
+      const [location, vehicle, pending, cooldown, points] = await Promise.all([
+        db.collection('driver_locations').findOne({ driverId }),
+        db.collection('vehicles').findOne({ driverId, status: 'APPROVED',
+          $or: [{ serviceCodes: serviceCode }, { serviceCode }] }),
+        db.collection('booking_offers_v69').findOne({ driverId, status: 'PENDING', expiresAt: { $gt: now } }),
+        db.collection('driver_cooldowns').findOne({ driverId, expiresAt: { $gt: now },
+          $or: [{ type: { $ne: 'SAME_BOOKING' } }, { type: 'SAME_BOOKING', bookingId }] }),
+        db.collection('driver_reward_accounts').findOne({ driverId }),
+      ]);
+      const coords = location?.location?.coordinates;
+      const lastGps = location?.updatedAt ? new Date(location.updatedAt) : null;
+      const gpsAgeSeconds = lastGps && Number.isFinite(lastGps.getTime())
+        ? Math.max(0, Math.floor((now - lastGps) / 1000)) : null;
+      const coordsValid = Array.isArray(coords) && coords.length >= 2 &&
+        Number.isFinite(Number(coords[0])) && Number.isFinite(Number(coords[1])) &&
+        Math.abs(Number(coords[1])) <= 90 && Math.abs(Number(coords[0])) <= 180 &&
+        !(Number(coords[0]) === 0 && Number(coords[1]) === 0);
+      const fresh = coordsValid && gpsAgeSeconds !== null && gpsAgeSeconds <= Number(policy.locationFreshSeconds);
+      const reasons = [];
+      if (!pickupValid) reasons.push('PICKUP_GPS_INVALID');
+      if (!vehicle) reasons.push('VEHICLE_SERVICE_NOT_APPROVED');
+      if (driver.activeBookingId) reasons.push('ACTIVE_BOOKING');
+      if (!location) reasons.push('DRIVER_GPS_MISSING');
+      else if (!coordsValid) reasons.push('DRIVER_GPS_INVALID');
+      else if (!fresh) reasons.push('DRIVER_GPS_STALE');
+      if (cooldown) reasons.push('DRIVER_COOLDOWN');
+      if (pending) reasons.push('DRIVER_HAS_PENDING_OFFER');
+      if (Number(points?.balance || 0) < Number(policy.pointsPolicy?.blockBelow ?? 0)) reasons.push('DRIVER_POINTS_BLOCKED');
+      const offerCandidate = candidates.find(c => String(c.driverId) === String(driverId));
+      if (fresh && vehicle && !offerCandidate) reasons.push('MATCHING_EXCLUDED');
+      if (offerCandidate && offerCandidate.pointsBlocked) reasons.push('DRIVER_POINTS_BLOCKED');
+      return { driverId: String(driverId), gpsAgeSeconds, gpsFresh: Boolean(fresh),
+        serviceEligible: Boolean(vehicle), candidate: Boolean(offerCandidate),
+        distanceKm: offerCandidate?.distanceKm ?? null, reasons };
+    }));
+    if (!pickupValid) reasons.push('PICKUP_GPS_INVALID');
     if (!cfg.enabled || !policy.autoDispatchEnabled) reasons.push('AUTO_DISPATCH_OFF');
     if (!['SEARCHING', 'OFFERED'].includes(booking.status)) reasons.push('BOOKING_NOT_SEARCHING');
     if (readyDrivers === 0) reasons.push('NO_APPROVED_ONLINE_DRIVER');
@@ -690,7 +750,9 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       config: { enabled: cfg.enabled, maxRounds: cfg.maxRounds, currentRadiusKm: r?.radiusKm },
       matchingPolicy: { autoDispatchEnabled: policy.autoDispatchEnabled, maxRadiusKm: policy.maxRadiusKm, allowNoGpsFallback: policy.allowNoGpsFallback, locationFreshSeconds: policy.locationFreshSeconds },
       statistics: { onlineDrivers, approvedOnlineDrivers: readyDrivers, locationRecords: locationCount, freshLocationRecords90s: freshLocationCount, gpsCandidates: candidates.filter(c => c.distanceKm != null).length, noGpsCandidates: candidates.filter(c => c.distanceKm == null).length, eligibleNearby: nearby.length, pendingOffers: activeOffers },
-      previewError, reasons, lastError: booking.dispatchEngine?.lastError || null,
+      previewError, reasons, driverChecks: perDriver,
+      driverChecksTruncated: readyDrivers > perDriver.length,
+      lastError: booking.dispatchEngine?.lastError || null,
     };
   }
 
