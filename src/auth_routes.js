@@ -1399,7 +1399,10 @@ function createAuthRouter({
             approvedServiceCodes: [],
             serviceCapabilities: [],
             servicePreferences: Object.fromEntries(
-              requestedServiceCodes.map((code) => [code, false]),
+              // Registering a service is an opt-in.  The KYC approval flow
+              // keeps this preference, so new approved drivers can receive
+              // offers without first visiting another settings screen.
+              requestedServiceCodes.map((code) => [code, true]),
             ),
 
             rating:

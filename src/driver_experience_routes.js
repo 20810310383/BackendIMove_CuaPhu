@@ -220,8 +220,16 @@ function createDriverExperienceRouter({ getDb, findDriverByPhone }) {
         ...(ctx.driver.servicePreferences && typeof ctx.driver.servicePreferences === 'object' ? ctx.driver.servicePreferences : {}),
         ...(vehicle?.servicePreferences && typeof vehicle.servicePreferences === 'object' ? vehicle.servicePreferences : {}),
       };
+      const hasExplicitPreferences = Boolean(
+        ctx.driver.servicePreferencesConfiguredAt ||
+        vehicle?.servicePreferencesConfiguredAt ||
+        approvedServiceCodes.some((code) => rawPreferences[String(code).toUpperCase()] === true),
+      );
       const servicePreferences = Object.fromEntries(
-        approvedServiceCodes.map((code) => [String(code).toUpperCase(), rawPreferences[String(code).toUpperCase()] !== false]),
+        approvedServiceCodes.map((code) => {
+          const normalizedCode = String(code).toUpperCase();
+          return [normalizedCode, !hasExplicitPreferences || rawPreferences[normalizedCode] !== false];
+        }),
       );
       return res.json({
         vehicleType: vehicle?.vehicleType || ctx.driver.vehicleType || ctx.driver.requestedVehicleType || 'MOTORBIKE',
@@ -254,8 +262,8 @@ function createDriverExperienceRouter({ getDb, findDriverByPhone }) {
       }
       const changedAt = new Date();
       await Promise.all([
-        db.collection('vehicles').updateOne({ _id: vehicle._id }, { $set: { servicePreferences, updatedAt: changedAt } }),
-        db.collection('drivers').updateOne({ _id: ctx.driver._id }, { $set: { servicePreferences, updatedAt: changedAt } }),
+        db.collection('vehicles').updateOne({ _id: vehicle._id }, { $set: { servicePreferences, servicePreferencesConfiguredAt: changedAt, updatedAt: changedAt } }),
+        db.collection('drivers').updateOne({ _id: ctx.driver._id }, { $set: { servicePreferences, servicePreferencesConfiguredAt: changedAt, updatedAt: changedAt } }),
       ]);
       return res.json({ ok: true, approvedServiceCodes, servicePreferences });
     } catch (error) { return res.status(400).json({ message: error.message }); }

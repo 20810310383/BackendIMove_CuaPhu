@@ -9,6 +9,7 @@ const { createAdminGuard } = require('./admin_guard');
 const { verifiedMetrics } = require('./trusted_route_pricing');
 const { DOCUMENT_TYPES, reviewStatus, missingReviewItems, reviewSummary } = require('./merchant_review_policy');
 const {storageRoot} = require('./local_storage_service');
+const { driverServicePreferenceEnabled } = require('./service_catalog_service');
 
 const ORDER_STATUSES = [
   'CREATED','WAITING_MERCHANT','MERCHANT_ACCEPTED','PREPARING','READY_FOR_PICKUP',
@@ -267,19 +268,16 @@ function driverCanHandleCommerce(driver, serviceCode) {
   const approved = Array.isArray(driver?.approvedServiceCodes)
     ? driver.approvedServiceCodes.map((x) => String(x || '').toUpperCase()).filter(Boolean)
     : [];
-  const preferences = driver?.servicePreferences && typeof driver.servicePreferences === 'object'
-    ? driver.servicePreferences
-    : null;
   // Driver mới: approvedServiceCodes là nguồn quyền chính thức và preference phải bật.
   if (approved.length) {
     if (!approved.includes(code)) return false;
-    if (preferences && preferences[code] === false) return false;
+    if (!driverServicePreferenceEnabled(driver, code)) return false;
     return true;
   }
   // Driver legacy: giữ tương thích serviceCapabilities cho tới khi Admin migrate hồ sơ.
   const caps = normalizeCaps(driver);
   if (!caps.length) return true;
-  if (preferences && preferences[code] === false) return false;
+  if (!driverServicePreferenceEnabled(driver, code)) return false;
   if (caps.includes(code)) return true;
   if (['FOOD','ERRAND','DELIVERY'].includes(code) && caps.includes('BIKE')) return true;
   if (['FOOD','ERRAND'].includes(code) && caps.includes('DELIVERY')) return true;

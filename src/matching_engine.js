@@ -8,7 +8,7 @@ const {
   normalizeMatchingPolicy,
   rankMatchingCandidates,
 } = require('./matching_policy');
-const { driverCanServe } = require('./service_catalog_service');
+const { driverCanServe, driverServicePreferenceEnabled } = require('./service_catalog_service');
 
 function asInt(value, fallback, min, max) {
   const n = Number(value);
@@ -405,17 +405,14 @@ function createMatchingEngine({
     const approved = Array.isArray(driver?.approvedServiceCodes)
       ? driver.approvedServiceCodes.map((x) => String(x || '').toUpperCase()).filter(Boolean)
       : [];
-    const prefs = driver?.servicePreferences && typeof driver.servicePreferences === 'object'
-      ? driver.servicePreferences
-      : null;
     if (approved.length) {
-      return approved.includes(code) && !(prefs && prefs[code] === false);
+      return approved.includes(code) && driverServicePreferenceEnabled(driver, code);
     }
     const legacy = Array.isArray(driver?.serviceCapabilities)
       ? driver.serviceCapabilities.map((x) => String(x || '').toUpperCase()).filter(Boolean)
       : [];
     if (!legacy.length) return true;
-    if (prefs && prefs[code] === false) return false;
+    if (!driverServicePreferenceEnabled(driver, code)) return false;
     if (legacy.includes(code)) return true;
     if (['FOOD','ERRAND','DELIVERY'].includes(code) && legacy.includes('BIKE')) return true;
     return false;

@@ -48,6 +48,19 @@ function normalizeServicePreferences(codes, raw = {}) {
   return Object.fromEntries(codes.map((code) => [code, source[code] !== false]));
 }
 
+function approvedServicePreferences(codes, vehicle, driver) {
+  const raw = vehicle?.servicePreferences || driver?.servicePreferences || {};
+  const hasExplicitChoice = Boolean(
+    vehicle?.servicePreferencesConfiguredAt ||
+    driver?.servicePreferencesConfiguredAt ||
+    codes.some((code) => raw[code] === true),
+  );
+  // Older onboarding records initialized every requested service as false.
+  // Until the driver has made a real preference choice, approval means the
+  // services requested at registration are enabled.
+  return normalizeServicePreferences(codes, hasExplicitChoice ? raw : {});
+}
+
 const now = () => new Date();
 const projectRoot = path.resolve(__dirname, '..');
 const uploadRoot = localPaths.kyc;
@@ -798,9 +811,8 @@ function createKycRouter({ getDb }) {
           approvedVehicle?.requestedServiceCodes || approvedVehicle?.serviceCodes,
           ['BIKE'],
         );
-        const approvedPreferences = normalizeServicePreferences(
-          approvedServiceCodes,
-          approvedVehicle?.servicePreferences || driver.servicePreferences || {},
+        const approvedPreferences = approvedServicePreferences(
+          approvedServiceCodes, approvedVehicle, driver,
         );
         await db.collection('vehicles').updateMany({ driverId }, { $set: {
           status: 'APPROVED',
@@ -858,8 +870,8 @@ function createKycRouter({ getDb }) {
       );
       const changedAt = now();
       await Promise.all([
-        db.collection('vehicles').updateOne({ _id: vehicle._id }, { $set: { approvedServiceCodes, servicePreferences, updatedAt: changedAt } }),
-        db.collection('drivers').updateOne({ _id: driverId }, { $set: { approvedServiceCodes, servicePreferences, updatedAt: changedAt } }),
+        db.collection('vehicles').updateOne({ _id: vehicle._id }, { $set: { approvedServiceCodes, servicePreferences, servicePreferencesConfiguredAt: changedAt, updatedAt: changedAt } }),
+        db.collection('drivers').updateOne({ _id: driverId }, { $set: { approvedServiceCodes, servicePreferences, servicePreferencesConfiguredAt: changedAt, updatedAt: changedAt } }),
         db.collection('verification_logs').insertOne({
           driverId,
           action: 'DRIVER_SERVICES_UPDATED',

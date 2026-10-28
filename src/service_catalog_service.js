@@ -21,6 +21,19 @@ function eligibleServiceCodes(vehicle){
   return [...new Set(raw.map(x=>String(x).toUpperCase()).filter(x=>SERVICE_CODES.includes(x)))];
 }
 function driverCanServe(vehicle, serviceCode){return eligibleServiceCodes(vehicle).includes(String(serviceCode||'').toUpperCase());}
+function driverServicePreferenceEnabled(driver, serviceCode){
+  const code=String(serviceCode||'').toUpperCase();
+  const preferences=driver?.servicePreferences&&typeof driver.servicePreferences==='object'?driver.servicePreferences:null;
+  if(!preferences || preferences[code]!==false)return true;
+  const approved=Array.isArray(driver?.approvedServiceCodes)?driver.approvedServiceCodes:[];
+  const legacy=Array.isArray(driver?.serviceCapabilities)?driver.serviceCapabilities:[];
+  const knownCodes=[...new Set((approved.length?approved:legacy).map(x=>String(x||'').toUpperCase()).filter(Boolean))];
+  // Older registrations wrote every preference as false before KYC approval.
+  // That is not a driver opt-out: a real preference update is marked, or has
+  // at least one service explicitly enabled (the app never permits all off).
+  const explicit=Boolean(driver?.servicePreferencesConfiguredAt)||knownCodes.some(item=>preferences[item]===true);
+  return !explicit;
+}
 function createServiceCatalogService({getDb}){
   async function listAll(){return getDb().collection('service_catalog').find({}).sort({sortOrder:1,code:1}).toArray();}
   async function listActive(){return getDb().collection('service_catalog').find({status:'ACTIVE',customerVisible:{$ne:false}}).sort({sortOrder:1,code:1}).toArray();}
@@ -32,4 +45,4 @@ function createServiceCatalogService({getDb}){
   }
   return {listAll,listActive,getByCode,saveService,eligibleServiceCodes};
 }
-module.exports={SERVICE_CODES,DEFAULT_SERVICES,normalizeService,eligibleServiceCodes,driverCanServe,createServiceCatalogService};
+module.exports={SERVICE_CODES,DEFAULT_SERVICES,normalizeService,eligibleServiceCodes,driverCanServe,driverServicePreferenceEnabled,createServiceCatalogService};
