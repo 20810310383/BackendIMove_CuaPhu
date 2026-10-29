@@ -159,7 +159,9 @@ const merchantReviewUpload = multer({
   }),
   limits:{fileSize:5*1024*1024,files:1},
   fileFilter(_req,file,cb) {
-    cb(null,['image/jpeg','image/png','image/webp'].includes(String(file.mimetype||'').toLowerCase()));
+    const mime=String(file.mimetype||'').toLowerCase();
+    if(!['image/jpeg','image/png','image/webp'].includes(mime))return cb(new Error('Chỉ hỗ trợ JPG, PNG hoặc WEBP dưới 5 MB.'));
+    cb(null,true);
   },
 });
 function verifiedReviewMime(buffer) {
@@ -851,7 +853,12 @@ function createMerchantRouter({ getDb, getNotifications }) {
   r.put('/store', async (req,res)=>{
     try{const patch={};for(const k of ['name','address','description','openingHours','pickupInstruction','categoryName'])if(req.body?.[k]!==undefined)patch[k]=String(req.body[k]).slice(0,400);if(req.body?.status!==undefined){const status=String(req.body.status).toUpperCase();if(!['ACTIVE','BUSY','PAUSED'].includes(status))return res.status(400).json({message:'Trạng thái hoạt động không hợp lệ.'});if(reviewStatus(req.merchantContext.merchant)!=='APPROVED')return res.status(403).json({message:'Cửa hàng chưa được duyệt, không thể mở nhận đơn.'});patch.status=status;}if(reviewStatus(req.merchantContext.merchant)==='APPROVED' && (req.body?.name!==undefined || req.body?.address!==undefined || req.body?.merchantType!==undefined))return res.status(409).json({message:'Thay đổi tên, địa chỉ hoặc loại hình cửa hàng đã duyệt cần liên hệ Admin.'});if(req.body?.merchantType!==undefined){const type=String(req.body.merchantType).toUpperCase();if(!['STORE','RESTAURANT'].includes(type))return res.status(400).json({message:'merchantType phải là STORE hoặc RESTAURANT.'});patch.merchantType=type;patch.merchantTypeLabel=type==='RESTAURANT'?'Nhà hàng · Food':'Cửa hàng · Đặt hộ';patch.categoryCode=type==='RESTAURANT'?'FOOD':'ERRAND';}patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id:req.merchantContext.merchant._id},{$set:patch});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id}))});}catch(e){res.status(400).json({message:e.message});}
   });
-  r.post('/store/media/:kind', merchantMediaUpload.single('image'), async (req,res)=>{
+  r.post('/store/media/:kind',(req,res,next)=>merchantMediaUpload.single('image')(req,res,(error)=>{
+    if(!error)return next();
+    if(error.code==='LIMIT_FILE_SIZE')return res.status(413).json({code:'FILE_TOO_LARGE',message:'Ảnh cửa hàng vượt dung lượng cho phép.'});
+    console.warn('[MERCHANT_MEDIA_UPLOAD]',error.message);
+    return res.status(400).json({code:'INVALID_IMAGE',message:error.message||'Không thể nhận ảnh.'});
+  }),async (req,res)=>{
     try {
       const kind=String(req.params.kind||'').toLowerCase();
       if(!['logo','cover'].includes(kind))return res.status(400).json({message:'kind phải là logo hoặc cover.'});
@@ -875,7 +882,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
       return res.json({merchant:serialize(merchant),kind,url:mediaUrl});
     } catch(e) {
       if(req.file?.path)fs.promises.unlink(req.file.path).catch(()=>{});
-      return res.status(400).json({message:e.message});
+      console.error('[MERCHANT_MEDIA_STORE]',e);return res.status(500).json({code:'MERCHANT_MEDIA_STORE_FAILED',message:'Lỗi lưu ảnh cửa hàng trên máy chủ; kiểm tra storage/merchant và MongoDB.'});
     }
   });
   r.get('/verification', async(req,res)=>{
@@ -886,7 +893,12 @@ function createMerchantRouter({ getDb, getNotifications }) {
     if(!DOCUMENT_TYPES.includes(String(req.params.kind||'').toUpperCase()))return res.status(400).json({message:'Loại giấy tờ không hợp lệ.'});
     if(reviewStatus(req.merchantContext.merchant)==='APPROVED')return res.status(409).json({message:'Hồ sơ đã duyệt; liên hệ Admin nếu cần thay đổi giấy tờ.'});
     return next();
-  },merchantReviewUpload.single('image'),async(req,res)=>{
+  },(req,res,next)=>merchantReviewUpload.single('image')(req,res,(error)=>{
+    if(!error)return next();
+    if(error.code==='LIMIT_FILE_SIZE')return res.status(413).json({code:'FILE_TOO_LARGE',message:'Ảnh hồ sơ vượt quá 5 MB. Vui lòng chọn ảnh nhỏ hơn.'});
+    console.warn('[MERCHANT_KYC_UPLOAD]',error.message);
+    return res.status(400).json({code:'INVALID_IMAGE',message:error.message||'Không thể nhận tệp ảnh.'});
+  }),async(req,res)=>{
     try{
       if(!req.file)return res.status(400).json({message:'Chọn ảnh JPG, PNG hoặc WEBP dưới 5 MB.'});
       const magic=verifiedReviewMime(await fs.promises.readFile(req.file.path));
@@ -899,7 +911,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
       const old=before?.reviewDocuments?.[kind]?.filename;
       if(old && /^[a-f0-9]{40}\.img$/.test(old) && old!==d.filename)fs.promises.unlink(path.join(MERCHANT_REVIEW_ROOT,String(merchantId),old)).catch(()=>{});
       return res.json({verification:reviewSummary(await getDb().collection('merchants').findOne({_id:merchantId}))});
-    }catch(e){if(req.file?.path)await fs.promises.unlink(req.file.path).catch(()=>{});return res.status(500).json({message:'Không lưu được giấy tờ.'});}
+    }catch(e){if(req.file?.path)await fs.promises.unlink(req.file.path).catch(()=>{});console.error('[MERCHANT_KYC_STORE]',e);return res.status(500).json({code:'MERCHANT_KYC_STORE_FAILED',message:'Không thể lưu hồ sơ trên máy chủ. Kiểm tra quyền ghi thư mục storage/private/merchant_review và kết nối MongoDB.'});}
   });
   r.post('/verification/submit',async(req,res)=>{
     try {
