@@ -17,8 +17,8 @@ function createMapRouter({ mapService = createMapService() } = {}) {
 
   router.get('/search', async (req, res) => {
     try {
-      const results = await mapService.search(req.query.q, { limit: req.query.limit, countryCode: req.query.country || 'vn' });
-      return res.json({ provider: 'OPENSTREETMAP', results });
+      const results = await mapService.search(req.query.q, { limit: req.query.limit, countryCode: req.query.country || 'vn', focusLat: req.query.lat, focusLon: req.query.lon });
+      return res.json({ provider: results[0]?.provider || mapService.publicConfig().geocodingProvider, results });
     } catch (error) {
       const status = error instanceof RangeError || error instanceof TypeError ? 400 : 502;
       return res.status(status).json({ code: 'MAP_SEARCH_FAILED', message: error.message });
@@ -28,7 +28,7 @@ function createMapRouter({ mapService = createMapService() } = {}) {
   router.get('/reverse', async (req, res) => {
     try {
       const place = await mapService.reverse(req.query.lat, req.query.lon);
-      return res.json({ provider: 'OPENSTREETMAP', place });
+      return res.json({ provider: place?.provider || mapService.publicConfig().geocodingProvider, place });
     } catch (error) {
       const status = error instanceof RangeError || error instanceof TypeError ? 400 : 502;
       return res.status(status).json({ code: 'MAP_REVERSE_FAILED', message: error.message });

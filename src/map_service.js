@@ -18,7 +18,7 @@ function assertLatLon(lat, lon) {
   return { latitude, longitude };
 }
 
-function normalizeSearchResults(items) {
+function normalizeSearchResults(items, query = '') {
   if (!Array.isArray(items)) return [];
   return items
     .map((item) => {
@@ -34,6 +34,8 @@ function normalizeSearchResults(items) {
         latitude,
         longitude,
         type: String(item?.type || item?.category || 'place'),
+        provider: 'OPENSTREETMAP',
+        matchQuality: houseMatchQuality(query, item?.address?.house_number, display),
       };
     })
     .filter(Boolean);
@@ -51,7 +53,65 @@ function normalizeReverseResult(item, latitude, longitude) {
     latitude: lat,
     longitude: lon,
     type: String(item?.type || item?.category || 'place'),
+    provider: 'OPENSTREETMAP',
+    matchQuality: 'NEARBY',
   };
+}
+
+
+// TrackAsia uses GeoJSON [longitude, latitude]. Do not mistake street-level
+// coordinates for an exact house entrance when the provider lacks housenumber.
+function queryHouseNumber(query) {
+  const matched = String(query || '').trim().match(/^(\d+[a-z]?(?:\s*[/-]\s*\d+[a-z]?)*)\b/i);
+  return matched ? matched[1].replace(/\s/g, '').toUpperCase() : '';
+}
+
+function houseMatchQuality(query, providerHouse, providerAddress = '') {
+  const requested = queryHouseNumber(query);
+  if (!requested) return 'PLACE';
+  const actual = String(providerHouse || '').replace(/\s/g, '').toUpperCase();
+  if (!actual || actual !== requested) return 'APPROXIMATE';
+  // A matching number on another road must not be presented as the same house.
+  const street = String(query).trim().replace(/^(\d+[a-z]?(?:\s*[/-]\s*\d+[a-z]?)*)\s*/i, '').split(',')[0].trim();
+  const normalize = (value) => String(value).normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/đ/g, 'd');
+  if (street.length >= 5 && !normalize(providerAddress).includes(normalize(street))) return 'APPROXIMATE';
+  return 'EXACT_HOUSE';
+}
+
+function normalizeTrackAsiaResults(payload, query = '') {
+  const features = Array.isArray(payload?.features) ? payload.features : [];
+  const unique = new Set();
+  return features.map((feature) => {
+    const props = feature?.properties || {};
+    const coords = feature?.geometry?.coordinates || [];
+    const longitude = Number(coords[0]);
+    const latitude = Number(coords[1]);
+    if (!Number.isFinite(latitude) || !Number.isFinite(longitude) ||
+        latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return null;
+    const address = String(props.label || props.name || '').trim();
+    if (!address) return null;
+    const placeId = `trackasia:${String(props.gid || props.id || `${latitude},${longitude}`)}`;
+    if (unique.has(placeId)) return null;
+    unique.add(placeId);
+    return {
+      placeId,
+      name: String(props.name || props.housenumber || address.split(',')[0] || address).trim(),
+      address,
+      latitude,
+      longitude,
+      type: String(props.layer || 'place'),
+      provider: 'TRACKASIA',
+      matchQuality: houseMatchQuality(query, props.housenumber, address),
+    };
+  }).filter(Boolean).sort((a,b) =>
+    Number(b.matchQuality === 'EXACT_HOUSE') - Number(a.matchQuality === 'EXACT_HOUSE'));
+}
+
+function normalizeTrackAsiaReverse(payload, latitude, longitude) {
+  const places = normalizeTrackAsiaResults(payload);
+  if (!places.length) return null;
+  // Reverse result is the nearest known address, not necessarily the actual door.
+  return { ...places[0], matchQuality: 'NEARBY' };
 }
 
 function normalizeRoute(payload, mode = 'BALANCED') {
@@ -127,6 +187,8 @@ function createMapService(options = {}) {
   const timeoutMs = Math.max(1000, Number(options.timeoutMs || process.env.OSM_HTTP_TIMEOUT_MS || 7000));
   const cacheMs = Math.max(0, Number(options.cacheMs || process.env.OSM_GEOCODE_CACHE_MS || 300000));
   const cache = new Map();
+  const trackAsiaKey = String(options.trackAsiaKey ?? process.env.TRACKASIA_API_KEY ?? '').trim();
+  const trackAsiaBaseUrl = trimBaseUrl(options.trackAsiaBaseUrl || process.env.TRACKASIA_API_BASE_URL, 'https://maps.track-asia.com');
 
   async function requestJson(url) {
     const controller = new AbortController();
@@ -159,22 +221,72 @@ function createMapService(options = {}) {
     return value;
   }
 
-  async function search(query, { limit = 5, countryCode = 'vn' } = {}) {
+  async function search(query, { limit = 5, countryCode = 'vn', focusLat, focusLon } = {}) {
     const q = String(query || '').trim();
     if (q.length < 2) return [];
     if (q.length > 120) throw new RangeError('query is too long');
     const safeLimit = Math.min(8, Math.max(1, Number(limit) || 5));
-    const params = new URLSearchParams({ q, format: 'jsonv2', addressdetails: '1', namedetails: '1', limit: String(safeLimit) });
-    if (countryCode) params.set('countrycodes', String(countryCode).toLowerCase());
-    const key = `s:${params.toString()}`;
-    return cached(key, async () => normalizeSearchResults(await requestJson(`${geocodingBaseUrl}/search?${params}`)));
+    const focus = Number.isFinite(Number(focusLat)) && Number.isFinite(Number(focusLon)) &&
+      focusLat !== undefined && focusLon !== undefined ? assertLatLon(focusLat, focusLon) : null;
+    const cacheKey = `s:${q.toLowerCase()}:${safeLimit}:${countryCode}:${focus ? `${focus.latitude.toFixed(3)},${focus.longitude.toFixed(3)}` : ''}:${Boolean(trackAsiaKey)}`;
+    return cached(cacheKey, async () => {
+      if (trackAsiaKey) {
+        // Exact-address entry -> TrackAsia Search. Partial entry -> Autocomplete.
+        const endpoint = queryHouseNumber(q) ? '/api/v1/search' : '/api/v1/autocomplete';
+        const params = new URLSearchParams({ text: q, lang: 'vi', size: String(safeLimit), key: trackAsiaKey, new_admin: 'true', include_old_admin: 'true' });
+        if (focus) {
+          params.set('focus.point.lat', String(focus.latitude));
+          params.set('focus.point.lon', String(focus.longitude));
+        }
+        try {
+          const payload = await requestJson(`${trackAsiaBaseUrl}${endpoint}?${params}`);
+          const results = normalizeTrackAsiaResults(payload, q);
+          if (results.length) return results.slice(0, safeLimit);
+        } catch (error) {
+          // Never log a URL with an API key. Old OSM is fallback, not primary.
+          console.warn('[iMove Maps] TrackAsia search unavailable:', String(error.message).slice(0, 120));
+        }
+      }
+      const params = new URLSearchParams({ q, format: 'jsonv2', addressdetails: '1', namedetails: '1', limit: String(safeLimit) });
+      if (countryCode) params.set('countrycodes', String(countryCode).toLowerCase());
+      const results = normalizeSearchResults(await requestJson(`${geocodingBaseUrl}/search?${params}`), q);
+      return results.slice(0, safeLimit);
+    });
   }
 
   async function reverse(latitude, longitude) {
     const point = assertLatLon(latitude, longitude);
-    const params = new URLSearchParams({ lat: String(point.latitude), lon: String(point.longitude), format: 'jsonv2', addressdetails: '1', namedetails: '1', zoom: '18' });
-    const key = `r:${point.latitude.toFixed(5)},${point.longitude.toFixed(5)}`;
-    return cached(key, async () => normalizeReverseResult(await requestJson(`${geocodingBaseUrl}/reverse?${params}`), point.latitude, point.longitude));
+    const cacheKey = `r:${point.latitude.toFixed(5)},${point.longitude.toFixed(5)}:${Boolean(trackAsiaKey)}`;
+    return cached(cacheKey, async () => {
+      if (trackAsiaKey) {
+        const params = new URLSearchParams({
+          'point.lat': String(point.latitude),
+          'point.lon': String(point.longitude),
+          'size': '5',
+          'lang': 'vi',
+          'new_admin': 'true',
+          'include_old_admin': 'true',
+          'key': trackAsiaKey,
+        });
+        try {
+          const result = normalizeTrackAsiaReverse(
+            await requestJson(`${trackAsiaBaseUrl}/api/v1/reverse?${params}`),
+            point.latitude, point.longitude,
+          );
+          if (result) return result;
+        } catch (error) {
+          console.warn('[iMove Maps] TrackAsia reverse unavailable:', String(error.message).slice(0, 120));
+        }
+      }
+      const params = new URLSearchParams({
+        lat: String(point.latitude), lon: String(point.longitude),
+        format: 'jsonv2', addressdetails: '1', namedetails: '1', zoom: '18',
+      });
+      return normalizeReverseResult(
+        await requestJson(`${geocodingBaseUrl}/reverse?${params}`),
+        point.latitude, point.longitude,
+      );
+    });
   }
 
   async function route(fromLat, fromLon, toLat, toLon, options = {}) {
@@ -193,7 +305,8 @@ function createMapService(options = {}) {
 
   function publicConfig() {
     return {
-      provider: 'OPENSTREETMAP',
+      provider: trackAsiaKey ? 'TRACKASIA' : 'OPENSTREETMAP',
+      geocodingProvider: trackAsiaKey ? 'TRACKASIA' : 'OPENSTREETMAP',
       tileUrl,
       attribution: '© OpenStreetMap contributors',
       geocodingViaBackend: true,
@@ -210,6 +323,9 @@ module.exports = {
   assertLatLon,
   normalizeSearchResults,
   normalizeReverseResult,
+  normalizeTrackAsiaResults,
+  queryHouseNumber,
+  houseMatchQuality,
   normalizeRoute,
   createFallbackRoute,
   createMapService,
