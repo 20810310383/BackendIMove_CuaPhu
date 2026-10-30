@@ -8,7 +8,6 @@ const { createAdminGuard } = require('./admin_guard');
 function oid(value) { try { return value instanceof ObjectId ? value : new ObjectId(String(value)); } catch { return null; } }
 function codeOf(value) { return String(value || '').trim().toUpperCase(); }
 function validCode(value) { return /^[A-Z0-9]{5,20}$/.test(value); }
-function normalizedPhone(value) { const phone=String(value||'').replace(/[^0-9]/g,''); return /^0[0-9]{9}$/.test(phone)?phone:null; }
 function clean(value, max=160) { return String(value || '').trim().slice(0,max); }
 function asId(doc) { if (!doc) return null; return { ...doc, _id:String(doc._id), ownerUserId:String(doc.ownerUserId||''), usedByUserId:doc.usedByUserId?String(doc.usedByUserId):null }; }
 function httpError(code, message) { const error=new Error(message); error.status=code; return error; }
@@ -43,7 +42,7 @@ function createReferralRouter({getDb}) {
       if(!token) throw httpError(401,'Thiếu phiên đăng nhập.');
       const payload=jwt.verify(token,String(process.env.JWT_ACCESS_SECRET||''), {issuer:'th79-imove',audience:'th79-imove-apps'});
       const id=oid(payload.sub);
-      const user=id && await getDb().collection('users').findOne({_id:id,status:{$ne:'BLOCKED'}});
+      const user=id && await getDb().collection('users').findOne({_id:id,status:'ACTIVE'});
       if(!user) throw httpError(401,'Tài khoản không hợp lệ.');
       const source=String(req.params.app||'').toUpperCase();
       if(!['CUSTOMER','DRIVER','MERCHANT'].includes(source)) throw httpError(400,'Ứng dụng không hợp lệ.');
@@ -64,46 +63,30 @@ function createReferralRouter({getDb}) {
         db.collection('referral_codes').find({ownerUserId:owner,status:'ACTIVE'}).limit(15).toArray(),
         db.collection('referral_redemptions').findOne({usedByUserId:owner}),
       ]);
-      res.json({codes:codes.map(asId),myReferralCode:normalizedPhone(req.referralUser.phone),applied:attribution?{code:attribution.code,sourceApp:attribution.sourceApp,status:attribution.status,createdAt:attribution.createdAt}:null});
+      res.json({codes:codes.map(asId),applied:attribution?{code:attribution.code,sourceApp:attribution.sourceApp,status:attribution.status,createdAt:attribution.createdAt}:null});
     }catch(e){handleError(res,e)}
   });
   router.post('/my-code',async(req,res)=>{
     try{
-      // Mọi tài khoản có số điện thoại hợp lệ đều dùng SĐT làm mã giới thiệu.
+      if(req.referralSource!=='CUSTOMER') throw httpError(403,'Chỉ User có thể tự tạo mã giới thiệu cá nhân.');
       const db=getDb(), uid=req.referralUser._id;
       let row=await db.collection('referral_codes').findOne({ownerUserId:uid,sourceType:'USER',status:'ACTIVE'});
-      const phoneCode=normalizedPhone(req.referralUser.phone);
-      if(!phoneCode)throw httpError(400,'SĐT tài khoản không hợp lệ.');
       if(!row){
-        const code=normalizedPhone(req.referralUser.phone);
-        if(!code) throw httpError(400,'Tài khoản chưa có số điện thoại Việt Nam hợp lệ để làm mã giới thiệu.');
+        const code=String(req.referralUser.phone || '').trim();
+        if(!/^0\d{9}$/.test(code)) throw httpError(409,'Tài khoản chưa có số điện thoại hợp lệ để tạo mã giới thiệu.');
         row={code,ownerUserId:uid,sourceType:'USER',partnerName:'',status:'ACTIVE',createdAt:new Date()};
         try {await db.collection('referral_codes').insertOne(row)}
         catch(e){if(e.code===11000) row=await db.collection('referral_codes').findOne({ownerUserId:uid,sourceType:'USER',status:'ACTIVE'});else throw e;}
       }
-      res.json({code:phoneCode,legacyCode:row.code!==phoneCode?row.code:null});
+      res.json({code:row.code});
     }catch(e){handleError(res,e)}
   });
   router.post('/apply',async(req,res)=>{
     try{
       const db=getDb(),uid=req.referralUser._id,code=codeOf(req.body?.code);
       if(!validCode(code)) throw httpError(400,'Mã giới thiệu phải gồm 5–20 chữ/số.');
-      let owner=await db.collection('referral_codes').findOne({code,status:'ACTIVE'});
-      if(!owner && normalizedPhone(code)) {
-        const customer=await db.collection('users').findOne({phone:code,status:'ACTIVE'});
-        if(customer) {
-          const existing=await db.collection('referral_codes').findOne({code});
-          if(existing && existing.status!=='ACTIVE') throw httpError(404,'Mã giới thiệu đã bị ngừng.');
-          const oldOwnerCode=await db.collection('referral_codes').findOne({ownerUserId:customer._id,sourceType:'USER',status:'ACTIVE'});
-          if(oldOwnerCode){owner=oldOwnerCode;}
-          else {
-          const candidate={code,ownerUserId:customer._id,sourceType:'USER',ownerPhone:code,status:'ACTIVE',createdAt:new Date()};
-          try { await db.collection('referral_codes').insertOne(candidate); owner=candidate; }
-          catch(e) { if(e.code!==11000) throw e; owner=await db.collection('referral_codes').findOne({code,status:'ACTIVE'}); }
-          }
-        }
-      }
-      if(!owner) throw httpError(404,'Không tìm thấy mã giới thiệu đang hoạt động. Hãy kiểm tra SĐT chủ mã.');
+      const owner=await db.collection('referral_codes').findOne({code,status:'ACTIVE'});
+      if(!owner) throw httpError(404,'Mã giới thiệu không tồn tại hoặc đã ngừng.');
       if(String(owner.ownerUserId)===String(uid)) throw httpError(400,'Không thể sử dụng mã của chính mình.');
       const old=await db.collection('referral_redemptions').findOne({usedByUserId:uid});
       if(old) throw httpError(409,'Tài khoản đã nhập mã giới thiệu trước đó.');

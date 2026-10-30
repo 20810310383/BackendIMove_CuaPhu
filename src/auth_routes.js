@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const { sendOtpSms, assertOtpThrottle } = require('./otp_delivery_service');
 const { getAppFeatureSettings } = require('./app_feature_settings');
 const { ObjectId, GridFSBucket } = require('mongodb');
+const { deletedPhoneHash, releaseLegacyDeletedPhone } = require('./customer_account_lifecycle');
 
 const router = express.Router();
 
@@ -527,48 +528,38 @@ function createAuthRouter({
             });
         }
 
+        // A deleted customer is never restored. Handle legacy Admin's soft
+        // deletes (status=DELETED but phone still occupied) before registration.
+        await releaseLegacyDeletedPhone(db, phone);
+        const users = db.collection('users');
+        const collision = await users.findOne({ phone });
+        if (collision) {
+          return res.status(409).json({
+            code: 'PHONE_ALREADY_REGISTERED',
+            message: 'Số điện thoại này đang gắn với tài khoản hiện có. Không thể đăng ký đè hoặc nhận lại lịch sử cũ.'
+          });
+        }
+        // Re-register with a previously deleted number does not use OTP.
+        // New numbers still follow Admin's existing OTP policy.
+        const wasPreviouslyDeleted = Boolean(await users.findOne({
+          status: 'DELETED', deletedPhoneHash: deletedPhoneHash(phone), roles: 'CUSTOMER'
+        }, { projection: { _id: 1 } }));
         const verificationToken = String(req.body?.verificationToken || '').trim();
-        const requireOtp = (await getAppFeatureSettings(db)).otpVerificationEnabled;
+        const requireOtp = !wasPreviouslyDeleted && (await getAppFeatureSettings(db)).otpVerificationEnabled;
         if (requireOtp) {
-          if (!verificationToken) {
-            return res.status(400).json({ code: 'OTP_REQUIRED', message: 'Vui lòng xác thực OTP số điện thoại trước khi đăng ký.' });
-          }
+          if (!verificationToken) return res.status(400).json({ code:'OTP_REQUIRED', message:'Vui lòng xác thực OTP số điện thoại trước khi đăng ký.' });
           try {
             ensureSecret();
             const verified = jwt.verify(verificationToken, JWT_ACCESS_SECRET, {
-              issuer: 'th79-imove',
-              audience: 'th79-imove-apps',
+              issuer:'th79-imove', audience:'th79-imove-apps'
             });
             if (verified?.kind !== 'OTP_VERIFICATION' || verified?.bypassedBecauseOtpDisabled === true || normalizePhone(verified?.phone) !== phone || !['CUSTOMER_PHONE_VERIFY','PHONE_VERIFY'].includes(String(verified?.purpose || '').toUpperCase())) {
-              return res.status(400).json({ code: 'OTP_INVALID', message: 'Phiên xác thực OTP không hợp lệ.' });
+              return res.status(400).json({ code:'OTP_INVALID', message:'Phiên xác thực OTP không hợp lệ.' });
             }
-          } catch (_) {
-            return res.status(400).json({ code: 'OTP_EXPIRED', message: 'Phiên xác thực OTP đã hết hạn. Vui lòng gửi lại mã.' });
-          }
+          } catch (_) { return res.status(400).json({ code:'OTP_EXPIRED', message:'Phiên xác thực OTP đã hết hạn.' }); }
         }
-
-        let user =
-          await db
-            .collection('users')
-            .findOne({
-              phone,
-            });
-
-        // Nếu booking trước đây đã tự tạo user
-        // passwordHash = null,
-        // cho phép khách hàng nhận lại tài khoản.
-        if (
-          user &&
-          user.passwordHash
-        ) {
-          return res
-            .status(409)
-            .json({
-              message:
-                'Số điện thoại này đã có tài khoản.',
-            });
-        }
-
+        // Never 'claim' an old user created by a booking (passwordHash=null).
+        // Registration always creates a fresh _id and isolated balance/history.
         const passwordHash =
           await bcrypt.hash(
             password,
@@ -578,83 +569,13 @@ function createAuthRouter({
         const changedAt =
           now();
 
-        if (user) {
-          await db
-            .collection('users')
-            .updateOne(
-              {
-                _id:
-                  user._id,
-              },
-              {
-                $set: {
-                  fullName,
-                  email,
-                  passwordHash,
-
-                  status:
-                    'ACTIVE',
-
-                  updatedAt:
-                    changedAt,
-                },
-
-                $addToSet: {
-                  roles:
-                    'CUSTOMER',
-                },
-              },
-            );
-
-          user =
-            await db
-              .collection('users')
-              .findOne({
-                _id:
-                  user._id,
-              });
-        } else {
-          const doc = {
-            phone,
-            fullName,
-            email,
-
-            passwordHash,
-
-            avatarUrl:
-              null,
-
-            status:
-              'ACTIVE',
-
-            roles: [
-              'CUSTOMER',
-            ],
-
-            lastLoginAt:
-              changedAt,
-
-            createdAt:
-              changedAt,
-
-            updatedAt:
-              changedAt,
-          };
-
-          const result =
-            await db
-              .collection('users')
-              .insertOne(
-                doc,
-              );
-
-          user = {
-            ...doc,
-
-            _id:
-              result.insertedId,
-          };
-        }
+        const doc = {
+          phone, fullName, email, passwordHash,
+          avatarUrl: null, status: 'ACTIVE', roles: ['CUSTOMER'],
+          lastLoginAt: changedAt, createdAt: changedAt, updatedAt: changedAt,
+        };
+        const result = await users.insertOne(doc);
+        const user = { ...doc, _id: result.insertedId };
 
         const tokens =
           await issueTokens({

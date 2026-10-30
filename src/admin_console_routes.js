@@ -2,6 +2,7 @@ const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { ObjectId, Int32 } = require('mongodb');
+const { softDeleteCustomer } = require('./customer_account_lifecycle');
 
 const ADMIN_ALL_PERMISSIONS = [
   'dashboard.view',
@@ -99,7 +100,7 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
 
   async function getArrayData(key) {
     const collection = db().collection(collectionMap[key]);
-    const filter = key === 'customers' && collectionMap.customers === 'users' ? { roles: 'CUSTOMER' } : {};
+    const filter = key === 'customers' && collectionMap.customers === 'users' ? { roles: 'CUSTOMER', status: { $ne: 'DELETED' } } : {};
     const rows = await collection.find(filter).sort({ createdAt: -1, _id: -1 }).toArray();
 
     if (key === 'drivers') {
@@ -115,8 +116,6 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
         ? await db().collection('vehicles').find({ driverId: { $in: driverIds } })
             .sort({ updatedAt: -1, _id: -1 }).toArray()
         : [];
-      const pointRows=driverIds.length?await db().collection('driver_reward_accounts').find({driverId:{$in:driverIds}}).project({driverId:1,balance:1}).toArray():[];
-      const pointByDriver=new Map(pointRows.map(x=>[String(x.driverId),Number(x.balance||0)]));
       const vehiclesByDriver = new Map();
       for (const vehicle of vehicles) {
         const key = String(vehicle.driverId || '');
@@ -149,7 +148,6 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
           phone: profile.phone || driver.phone || null,
           email: profile.email || driver.email || null,
           onlineStatus: publicDriverOnlineStatus(driver.onlineStatus),
-          pointsBalance:pointByDriver.get(String(driver._id||driver.id))??0,
         });
       });
     }
@@ -870,6 +868,7 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     try {
       const { key } = req.params;
       if (!allowedArrayKeys.has(key)) return res.status(404).json({ message: 'Collection không được hỗ trợ' });
+      if (key === 'customers' && collectionMap.customers === 'users') return res.status(405).json({ message:'Không được ghi đè toàn bộ users bằng đồng bộ mảng. Hãy dùng API quản trị tài khoản.' });
       const beforeCount=await db().collection(collectionMap[key]).countDocuments();
       const result=await syncArrayData(key, req.body);
       await auditAdmin(req,'ADMIN_DATA_SYNC','ADMIN_DATA',key,{collection:key,count:beforeCount},{collection:key,count:Array.isArray(result)?result.length:0});
@@ -890,6 +889,14 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
       const id = new ObjectId(String(req.params.id));
       const existing = await db().collection('users').findOne({ _id: id, roles: 'CUSTOMER' });
       if (!existing) return res.status(404).json({ message: 'Không tìm thấy tài khoản CUSTOMER' });
+      const requestedStatus = 'status' in req.body ? String(req.body.status || '').trim().toUpperCase() : null;
+      if (requestedStatus === 'DELETED') {
+        if (!req.adminAccess?.permissions?.includes('users.block')) return res.status(403).json({message:'Yêu cầu quyền users.block để xóa mềm.'});
+        const result = await softDeleteCustomer(db(), existing, { reason: req.body?.reason || 'ADMIN_REQUEST' });
+        await auditAdmin(req, 'CUSTOMER_SOFT_DELETE', 'CUSTOMER', id, { id:String(id), status:existing.status }, result);
+        return res.json(result);
+      }
+      if (existing.status === 'DELETED') return res.status(409).json({code:'ACCOUNT_DELETED',message:'Tài khoản đã xóa không được phục hồi hoặc sửa thông tin. Hãy đăng ký tài khoản mới.'});
       const update = { updatedAt: new Date() };
       if ('fullName' in req.body) {
         const fullName = String(req.body.fullName || '').trim();
@@ -907,58 +914,30 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
       if ('status' in req.body) {
         const status = String(req.body.status || '').trim().toUpperCase();
         if (!USER_STATUSES.has(status)) return res.status(400).json({ message: 'Trạng thái người dùng không hợp lệ' });
-        if(status==='BLOCKED'){const reason=String(req.body.reason||'').trim();if(reason.length<10)return res.status(400).json({message:'Cần nhập lý do khóa ít nhất 10 ký tự.'});update.lockReason=reason.slice(0,400);update.lockedAt=new Date();}
-        if(status==='ACTIVE'){update.lockReason='';update.lockedAt=null;}
         update.status = status;
       }
       const result = await db().collection('users').findOneAndUpdate({ _id: id, roles: 'CUSTOMER' }, { $set: update }, { returnDocument: 'after' });
-      if(update.status==='BLOCKED')await db().collection('auth_sessions').updateMany({userId:id,revokedAt:{$exists:false}},{$set:{revokedAt:new Date(),revokeReason:'ADMIN_BLOCKED',updatedAt:new Date()}});
       await auditAdmin(req,'CUSTOMER_UPDATE','CUSTOMER',id,serializeDoc(existing),serializeDoc(result));
       res.json(serializeDoc(result));
-    } catch (error) { res.status(500).json({ message: error.message }); }
+    } catch (error) {
+      console.error('[CUSTOMER UPDATE]', error);
+      res.status(error.status || 500).json({ code:error.status ? error.code : 'CUSTOMER_UPDATE_FAILED', message:error.status ? error.message : 'Không thể cập nhật tài khoản. Xem log Backend.' });
+    }
   });
 
   router.delete('/api/users/:id', requireAdminAccess('users.block'), async (req, res) => {
     try {
-      if (!ObjectId.isValid(String(req.params.id))) return res.status(400).json({ message: 'ID người dùng MongoDB không hợp lệ' });
+      if (!ObjectId.isValid(String(req.params.id))) return res.status(400).json({message:'ID khách hàng không hợp lệ'});
       const id = new ObjectId(String(req.params.id));
       const existing = await db().collection('users').findOne({ _id: id, roles: 'CUSTOMER' });
-      if (!existing) return res.status(404).json({ message: 'Không tìm thấy tài khoản CUSTOMER' });
-      if((existing.roles||[]).some(role=>role!=='CUSTOMER'))return res.status(409).json({message:'Tài khoản dùng nhiều vai trò, không thể xóa vì sẽ ảnh hưởng Driver/Merchant. Hãy khóa tài khoản.'});
-      const bookingCount = await db().collection(collectionMap.trips).countDocuments({ customerId: id });
-      if (bookingCount > 0) return res.status(409).json({ message: `Khách hàng đã có ${bookingCount} chuyến xe. Hãy khóa tài khoản thay vì xóa để giữ lịch sử.` });
-      if(await db().collection('orders').countDocuments({customerId:id},{limit:1}))return res.status(409).json({message:'Khách hàng có đơn Commerce, cần khóa tài khoản thay vì xóa.'});
-      for(const [collection,field] of [['wallet_transactions','userId'],['loyalty_transactions','userId'],['referral_redemptions','usedByUserId'],['referral_codes','ownerUserId']]){
-        if(await db().collection(collection).countDocuments({[field]:id},{limit:1}))return res.status(409).json({message:'Tài khoản có dữ liệu tài chính/giới thiệu, hãy khóa thay vì xóa.'});
-      }
-      const result = await db().collection('users').deleteOne({ _id: id, roles: 'CUSTOMER' });
-      if (!result.deletedCount) return res.status(404).json({ message: 'Không tìm thấy tài khoản CUSTOMER' });
-      await db().collection('auth_sessions').updateMany({userId:id,revokedAt:{$exists:false}},{$set:{revokedAt:new Date(),revokeReason:'CUSTOMER_DELETED',updatedAt:new Date()}});
-      await auditAdmin(req,'CUSTOMER_DELETE','CUSTOMER',id,serializeDoc(existing),null);
-      res.json({ success: true });
-    } catch (error) { res.status(500).json({ message: error.message }); }
-  });
-
-  // Driver deletion is a soft archive: KYC, ledger, history, and payments remain auditable.
-  router.post('/api/admin/drivers/:id/archive',requireAdminAccess('drivers.suspend'),async(req,res)=>{
-    try{
-      const id=objectIdOrNull(req.params.id),reason=String(req.body?.reason||'').trim().slice(0,400);
-      if(!id)return res.status(400).json({message:'Driver ID không hợp lệ.'});
-      if(reason.length<10)return res.status(400).json({message:'Nhập lý do ít nhất 10 ký tự.'});
-      const col=db().collection('drivers'),driver=await col.findOne({_id:id});
-      if(!driver)return res.status(404).json({message:'Không tìm thấy tài xế.'});
-      if(driver.adminArchivedAt)return res.status(409).json({message:'Tài xế đã lưu trữ.'});
-      if(await db().collection('bookings').countDocuments({driverId:id,status:{$in:['DRIVER_ASSIGNED','DRIVER_ARRIVING','DRIVER_ARRIVED','IN_PROGRESS','OFFERED']}},{limit:1}))return res.status(409).json({message:'Tài xế đang có chuyến hoạt động, không thể lưu trữ.'});
-      const now=new Date();
-      const changed=await col.updateOne({_id:id,adminArchivedAt:{$exists:false}},{$set:{adminArchivedAt:now,adminArchiveReason:reason,status:'SUSPENDED',onlineStatus:'OFFLINE',updatedAt:now}});
-      if(!changed.modifiedCount)return res.status(409).json({message:'Tài xế đã đổi trạng thái. Tải lại.'});
-      if(driver.userId){const user=await db().collection('users').findOne({_id:driver.userId});if(user&&Array.isArray(user.roles)&&user.roles.every(x=>x==='DRIVER')){
-        await db().collection('users').updateOne({_id:driver.userId},{$set:{status:'BLOCKED',lockReason:reason,lockedAt:now,updatedAt:now}});
-        await db().collection('auth_sessions').updateMany({userId:driver.userId,revokedAt:{$exists:false}},{$set:{revokedAt:now,revokeReason:'DRIVER_ARCHIVED',updatedAt:now}});
-      }}
-      await auditAdmin(req,'DRIVER_ARCHIVE','DRIVER',id,null,{reason,archivedAt:now});
-      res.json({ok:true,id:String(id)});
-    }catch(e){console.error('[DRIVER_ARCHIVE]',e);res.status(500).json({message:'Không thể lưu trữ tài xế.'});}
+      if (!existing) return res.status(404).json({message:'Không tìm thấy khách hàng'});
+      const result = await softDeleteCustomer(db(), existing, {reason: req.body?.reason || 'ADMIN_REQUEST'});
+      await auditAdmin(req, 'CUSTOMER_SOFT_DELETE', 'CUSTOMER', id, {id:String(id),status:existing.status}, result);
+      return res.json(result);
+    } catch (error) {
+      console.error('[CUSTOMER SOFT DELETE]', error);
+      return res.status(error.status || 500).json({ code: error.status ? error.code : 'SOFT_DELETE_FAILED', message: error.status ? error.message : 'Không thể xóa mềm tài khoản. Xem log Backend.' });
+    }
   });
 
   // ============================================================
