@@ -10,6 +10,7 @@ const { verifiedMetrics } = require('./trusted_route_pricing');
 const { DOCUMENT_TYPES, reviewStatus, missingReviewItems, reviewSummary } = require('./merchant_review_policy');
 const {storageRoot} = require('./local_storage_service');
 const { driverServicePreferenceEnabled } = require('./service_catalog_service');
+const { CONFIG_ID: MERCHANT_FEE_CONFIG_ID, normalizeRules: normalizeMerchantFeeRules, loadMerchantFees, calculateMerchantFees } = require('./merchant_fee_policy');
 
 const ORDER_STATUSES = [
   'CREATED','WAITING_MERCHANT','MERCHANT_ACCEPTED','PREPARING','READY_FOR_PICKUP',
@@ -130,6 +131,11 @@ function publicMerchantRecord(merchant) {
   for (const key of ['reviewDocuments','reviewReason','reviewedBy','reviewedAt','approvalStatus','submittedAt']) delete record[key];
   return record;
 }
+function serializeCustomerOrder(order) {
+  const value = serialize(order);
+  if (value) delete value.merchantFeeSnapshot; // phí B2B không thuộc phản hồi của khách
+  return value;
+}
 function serialize(value) {
   if (!value) return value;
   const out = { ...value };
@@ -159,9 +165,7 @@ const merchantReviewUpload = multer({
   }),
   limits:{fileSize:5*1024*1024,files:1},
   fileFilter(_req,file,cb) {
-    const mime=String(file.mimetype||'').toLowerCase();
-    if(!['image/jpeg','image/png','image/webp'].includes(mime))return cb(new Error('Chỉ hỗ trợ JPG, PNG hoặc WEBP dưới 5 MB.'));
-    cb(null,true);
+    cb(null,['image/jpeg','image/png','image/webp'].includes(String(file.mimetype||'').toLowerCase()));
   },
 });
 function verifiedReviewMime(buffer) {
@@ -205,7 +209,7 @@ const merchantMediaUpload = multer({
     },
   }),
   limits: {
-    fileSize: Math.max(1, Number(process.env.MERCHANT_MEDIA_MAX_FILE_MB || 8)) * 1024 * 1024,
+    fileSize: Math.max(1, Number(process.env.MERCHANT_MEDIA_MAX_FILE_MB || 5)) * 1024 * 1024,
   },
   fileFilter(_req, file, cb) {
     const allowed = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
@@ -215,6 +219,18 @@ const merchantMediaUpload = multer({
     cb(null, true);
   },
 });
+
+function acceptMerchantMedia(req,res,next) {
+  merchantMediaUpload.single('image')(req,res,(error)=>{
+    if (!error) return next();
+    return res.status(error.code==='LIMIT_FILE_SIZE'?413:415).json({
+      code:error.code||'INVALID_MEDIA',
+      message:error.code==='LIMIT_FILE_SIZE'
+        ? 'Ảnh sau nén vượt quá 5 MB. Hãy chọn ảnh nhỏ hơn.'
+        : (error.message||'Ảnh không hợp lệ.'),
+    });
+  });
+}
 
 function merchantMediaPublicPath(merchantId, filename) {
   return `/api/v16/commerce/merchant-media/${encodeURIComponent(String(merchantId))}/${encodeURIComponent(path.basename(filename))}`;
@@ -601,7 +617,7 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
         const prior=await db.collection('orders').findOne(idemFilter);
         if(prior){
           if(prior.requestDigest!==requestDigest)return res.status(409).json({code:'IDEMPOTENCY_KEY_CONFLICT',message:'Khóa yêu cầu đã được dùng với nội dung khác.'});
-          return res.status(200).json({order:serialize(prior),duplicate:true});
+          return res.status(200).json({order:serializeCustomerOrder(prior),duplicate:true});
         }
       }
       let merchant = null;
@@ -639,11 +655,14 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
       const deliveryFee = Number(deliveryExtra.total);
       if(!Number.isSafeInteger(deliveryFee)||deliveryFee<0||!Number.isSafeInteger(subtotal+deliveryFee))return res.status(409).json({code:'INVALID_FARE',message:'Không thể xác định giá đơn hàng hợp lệ.'});
       const fareSnapshot={...pricing.fareSnapshot,customerTotal:deliveryFee,total:deliveryFee,deliveryExtra:{preference:deliveryExtra.preference,preferenceSurcharge:deliveryExtra.preferenceSurcharge,fragileSurcharge:deliveryExtra.fragileSurcharge,codAmount:deliveryExtra.codAmount},breakdown:{...(pricing.fareSnapshot?.breakdown||{}),baseDeliveryFee,preferenceSurcharge:deliveryExtra.preferenceSurcharge,fragileSurcharge:deliveryExtra.fragileSurcharge}};
+      // Snapshot phí theo từng đơn tại thời điểm đặt, không tính lại khi Admin đổi biểu phí.
+      const merchantFeeSnapshot = merchantId ? calculateMerchantFees({subtotal, merchantId, config: await loadMerchantFees(db)}) : null;
       const now = new Date();
       const doc = {
         orderCode:orderCode(),serviceCode,customerId:req.auth.user._id,
         ...(idempotencyKey?{idempotencyKey,requestDigest}:{}),merchantId,driverId:null,
         status:merchantId?'WAITING_MERCHANT':'CREATED',items,subtotal,deliveryFee,
+        ...(merchantFeeSnapshot ? {merchantFeeSnapshot} : {}),
         serviceFee:0,discount:0,
         total:subtotal+deliveryFee, // Only server-computed amounts are allowed here.
         fareSnapshot,
@@ -676,21 +695,21 @@ function createCommercePublicRouter({ getDb, requireCustomer, getPricing, getNot
       if(!merchantId && ['DELIVERY','ERRAND'].includes(serviceCode)){
         setImmediate(()=>dispatchCommerceReady({db,order:doc,notificationService:getNotifications?getNotifications():null,actorType:'SYSTEM'}).catch((error)=>console.error('[COMMERCE AUTO DISPATCH]',error.message)));
       }
-      res.status(201).json({order:serialize(doc),autoDispatch:!merchantId});
+      res.status(201).json({order:serializeCustomerOrder(doc),autoDispatch:!merchantId});
     } catch(e){
       if(e?.code===11000 && req.get('idempotency-key')){
         const prior=await getDb().collection('orders').findOne({customerId:req.auth.user._id,idempotencyKey:String(req.get('idempotency-key')).trim()});
         if(prior){
           const incomingDigest=crypto.createHash('sha256').update(JSON.stringify(req.body||{})).digest('hex');
           if(prior.requestDigest!==incomingDigest)return res.status(409).json({code:'IDEMPOTENCY_KEY_CONFLICT',message:'Khóa yêu cầu đã được dùng với nội dung khác.'});
-          return res.status(200).json({order:serialize(prior),duplicate:true});
+          return res.status(200).json({order:serializeCustomerOrder(prior),duplicate:true});
         }
       }
       res.status(e.httpStatus|| (e?.code===11000?409:400)).json({code:e.code||null,message:e.message});
     }
   });
   r.get('/orders', requireCustomer, async (req,res) => {
-    try { const rows=await getDb().collection('orders').find({customerId:req.auth.user._id}).sort({createdAt:-1}).limit(100).toArray();res.json({orders:rows.map(serialize)}); }
+    try { const rows=await getDb().collection('orders').find({customerId:req.auth.user._id}).sort({createdAt:-1}).limit(100).toArray();res.json({orders:rows.map(serializeCustomerOrder)}); }
     catch(e){res.status(500).json({message:e.message});}
   });
   return r;
@@ -824,6 +843,23 @@ function createMerchantRouter({ getDb, getNotifications }) {
       });
     }catch(e){res.status(400).json({message:e.message});}
   });
+  // Merchant fee preview: never trust a client-side percentage for settlement.
+  r.get('/fee-preview', async (req,res)=>{
+    try{
+      const price = Number(req.query.price);
+      const config = await loadMerchantFees(getDb());
+      return res.json({preview:calculateMerchantFees({subtotal:price,merchantId:req.merchantContext.merchant._id,config}),configured:config.rules.some(x=>x.enabled)});
+    }catch(e){return res.status(e.statusCode||500).json({message:e.message});}
+  });
+  r.get('/fee-settlement-summary', async (req,res)=>{
+    try{
+      const merchantId=req.merchantContext.merchant._id;
+      const rows=await getDb().collection('orders').find({merchantId,status:{$in:['DELIVERED','COMPLETED']}},{projection:{orderCode:1,merchantFeeSnapshot:1,subtotal:1,createdAt:1}}).sort({createdAt:-1}).limit(100).toArray();
+      const snapshotRows=rows.filter(x=>x.merchantFeeSnapshot);
+      const totals=snapshotRows.reduce((a,o)=>({gross:a.gross+o.merchantFeeSnapshot.grossAmount,fees:a.fees+o.merchantFeeSnapshot.feeTotal,net:a.net+o.merchantFeeSnapshot.netAmount}),{gross:0,fees:0,net:0});
+      return res.json({totals,orderCount:snapshotRows.length,orders:snapshotRows.map(x=>({orderCode:x.orderCode,createdAt:x.createdAt,merchantFeeSnapshot:x.merchantFeeSnapshot})),note:'Chỉ tính đơn hoàn thành có snapshot phí; chưa cộng hoàn tiền/thuế/điều chỉnh.'});
+    }catch(e){return res.status(500).json({message:e.message});}
+  });
   r.get('/products', async (req,res)=>{try{const rows=await getDb().collection('products').find({merchantId:req.merchantContext.merchant._id}).sort({categoryName:1,sortOrder:1,name:1}).toArray();res.json({products:rows.map(serialize)});}catch(e){res.status(500).json({message:e.message});}});
   r.post('/products', async (req,res)=>{
     try{const now=new Date();const doc={merchantId:req.merchantContext.merchant._id,name:String(req.body?.name||'').trim(),description:String(req.body?.description||'').trim(),categoryName:String(req.body?.categoryName||'Khác').trim(),price:Math.max(0,Number(req.body?.price||0)),imageUrl:req.body?.imageUrl||null,status:String(req.body?.status||'ACTIVE').toUpperCase(),stockStatus:String(req.body?.stockStatus||'AVAILABLE').toUpperCase(),sortOrder:Number(req.body?.sortOrder||0),createdAt:now,updatedAt:now};if(doc.name.length<2)return res.status(400).json({message:'Tên sản phẩm quá ngắn.'});const x=await getDb().collection('products').insertOne(doc);doc._id=x.insertedId;res.status(201).json({product:serialize(doc)});}catch(e){res.status(400).json({message:e.message});}
@@ -832,7 +868,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
     try{const _id=oid(req.params.id);if(!_id)return res.status(400).json({message:'Product ID không hợp lệ.'});const patch={};for(const k of ['name','description','categoryName','imageUrl','status','stockStatus','sortOrder'])if(req.body?.[k]!==undefined)patch[k]=req.body[k];if(req.body?.price!==undefined)patch.price=Math.max(0,Number(req.body.price||0));patch.updatedAt=new Date();const x=await getDb().collection('products').updateOne({_id,merchantId:req.merchantContext.merchant._id},{$set:patch});if(!x.matchedCount)return res.status(404).json({message:'Không tìm thấy sản phẩm.'});res.json({product:serialize(await getDb().collection('products').findOne({_id}))});}catch(e){res.status(400).json({message:e.message});}
   });
   // Upload a real product photo; only the owning merchant can replace it.
-  r.post('/products/:id/media', merchantMediaUpload.single('image'), async (req,res)=>{
+  r.post('/products/:id/media', acceptMerchantMedia, async (req,res)=>{
     try {
       const _id=oid(req.params.id);
       if(!_id){if(req.file?.path)fs.promises.unlink(req.file.path).catch(()=>{});return res.status(400).json({message:'Product ID không hợp lệ.'});}
@@ -853,12 +889,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
   r.put('/store', async (req,res)=>{
     try{const patch={};for(const k of ['name','address','description','openingHours','pickupInstruction','categoryName'])if(req.body?.[k]!==undefined)patch[k]=String(req.body[k]).slice(0,400);if(req.body?.status!==undefined){const status=String(req.body.status).toUpperCase();if(!['ACTIVE','BUSY','PAUSED'].includes(status))return res.status(400).json({message:'Trạng thái hoạt động không hợp lệ.'});if(reviewStatus(req.merchantContext.merchant)!=='APPROVED')return res.status(403).json({message:'Cửa hàng chưa được duyệt, không thể mở nhận đơn.'});patch.status=status;}if(reviewStatus(req.merchantContext.merchant)==='APPROVED' && (req.body?.name!==undefined || req.body?.address!==undefined || req.body?.merchantType!==undefined))return res.status(409).json({message:'Thay đổi tên, địa chỉ hoặc loại hình cửa hàng đã duyệt cần liên hệ Admin.'});if(req.body?.merchantType!==undefined){const type=String(req.body.merchantType).toUpperCase();if(!['STORE','RESTAURANT'].includes(type))return res.status(400).json({message:'merchantType phải là STORE hoặc RESTAURANT.'});patch.merchantType=type;patch.merchantTypeLabel=type==='RESTAURANT'?'Nhà hàng · Food':'Cửa hàng · Đặt hộ';patch.categoryCode=type==='RESTAURANT'?'FOOD':'ERRAND';}patch.updatedAt=new Date();await getDb().collection('merchants').updateOne({_id:req.merchantContext.merchant._id},{$set:patch});res.json({merchant:serialize(await getDb().collection('merchants').findOne({_id:req.merchantContext.merchant._id}))});}catch(e){res.status(400).json({message:e.message});}
   });
-  r.post('/store/media/:kind',(req,res,next)=>merchantMediaUpload.single('image')(req,res,(error)=>{
-    if(!error)return next();
-    if(error.code==='LIMIT_FILE_SIZE')return res.status(413).json({code:'FILE_TOO_LARGE',message:'Ảnh cửa hàng vượt dung lượng cho phép.'});
-    console.warn('[MERCHANT_MEDIA_UPLOAD]',error.message);
-    return res.status(400).json({code:'INVALID_IMAGE',message:error.message||'Không thể nhận ảnh.'});
-  }),async (req,res)=>{
+  r.post('/store/media/:kind', acceptMerchantMedia, async (req,res)=>{
     try {
       const kind=String(req.params.kind||'').toLowerCase();
       if(!['logo','cover'].includes(kind))return res.status(400).json({message:'kind phải là logo hoặc cover.'});
@@ -882,7 +913,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
       return res.json({merchant:serialize(merchant),kind,url:mediaUrl});
     } catch(e) {
       if(req.file?.path)fs.promises.unlink(req.file.path).catch(()=>{});
-      console.error('[MERCHANT_MEDIA_STORE]',e);return res.status(500).json({code:'MERCHANT_MEDIA_STORE_FAILED',message:'Lỗi lưu ảnh cửa hàng trên máy chủ; kiểm tra storage/merchant và MongoDB.'});
+      return res.status(400).json({message:e.message});
     }
   });
   r.get('/verification', async(req,res)=>{
@@ -893,12 +924,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
     if(!DOCUMENT_TYPES.includes(String(req.params.kind||'').toUpperCase()))return res.status(400).json({message:'Loại giấy tờ không hợp lệ.'});
     if(reviewStatus(req.merchantContext.merchant)==='APPROVED')return res.status(409).json({message:'Hồ sơ đã duyệt; liên hệ Admin nếu cần thay đổi giấy tờ.'});
     return next();
-  },(req,res,next)=>merchantReviewUpload.single('image')(req,res,(error)=>{
-    if(!error)return next();
-    if(error.code==='LIMIT_FILE_SIZE')return res.status(413).json({code:'FILE_TOO_LARGE',message:'Ảnh hồ sơ vượt quá 5 MB. Vui lòng chọn ảnh nhỏ hơn.'});
-    console.warn('[MERCHANT_KYC_UPLOAD]',error.message);
-    return res.status(400).json({code:'INVALID_IMAGE',message:error.message||'Không thể nhận tệp ảnh.'});
-  }),async(req,res)=>{
+  },merchantReviewUpload.single('image'),async(req,res)=>{
     try{
       if(!req.file)return res.status(400).json({message:'Chọn ảnh JPG, PNG hoặc WEBP dưới 5 MB.'});
       const magic=verifiedReviewMime(await fs.promises.readFile(req.file.path));
@@ -911,7 +937,7 @@ function createMerchantRouter({ getDb, getNotifications }) {
       const old=before?.reviewDocuments?.[kind]?.filename;
       if(old && /^[a-f0-9]{40}\.img$/.test(old) && old!==d.filename)fs.promises.unlink(path.join(MERCHANT_REVIEW_ROOT,String(merchantId),old)).catch(()=>{});
       return res.json({verification:reviewSummary(await getDb().collection('merchants').findOne({_id:merchantId}))});
-    }catch(e){if(req.file?.path)await fs.promises.unlink(req.file.path).catch(()=>{});console.error('[MERCHANT_KYC_STORE]',e);return res.status(500).json({code:'MERCHANT_KYC_STORE_FAILED',message:'Không thể lưu hồ sơ trên máy chủ. Kiểm tra quyền ghi thư mục storage/private/merchant_review và kết nối MongoDB.'});}
+    }catch(e){if(req.file?.path)await fs.promises.unlink(req.file.path).catch(()=>{});return res.status(500).json({message:'Không lưu được giấy tờ.'});}
   });
   r.post('/verification/submit',async(req,res)=>{
     try {
@@ -989,6 +1015,27 @@ function createCommerceDriverRouter({ getDb, requireApprovedDriver, findDriverBy
 
 function createCommerceAdminRouter({ getDb, getNotifications }) {
   const r=express.Router();const {requireAdmin,permit}=createAdminGuard({getDb});r.use(requireAdmin);
+  r.get('/merchant-fees',permit('merchants.view'),async(_req,res)=>{
+    try{return res.json(await loadMerchantFees(getDb()));}
+    catch(e){return res.status(500).json({message:e.message});}
+  });
+  r.put('/merchant-fees',permit('merchants.manage'),async(req,res)=>{
+    try{
+      const db=getDb();const rules=normalizeMerchantFeeRules(req.body?.rules);
+      const revision=Number(req.body?.revision);
+      if(!Number.isSafeInteger(revision)||revision<0)return res.status(400).json({message:'Thiếu phiên bản biểu phí.'});
+      const old=await loadMerchantFees(db);
+      if(old.revision!==revision)return res.status(409).json({message:'Biểu phí đã được Admin khác cập nhật. Tải lại trước khi lưu.'});
+      const next={revision:revision+1,rules,updatedAt:new Date(),updatedBy:req.admin._id};
+      const result=await db.collection('commerce_settings').updateOne({_id:MERCHANT_FEE_CONFIG_ID,revision},{$set:next});
+      if(!result.matchedCount && revision===0){
+        try{await db.collection('commerce_settings').insertOne({_id:MERCHANT_FEE_CONFIG_ID,...next});}
+        catch(e){if(e.code===11000)return res.status(409).json({message:'Biểu phí đã được thay đổi. Vui lòng tải lại.'});throw e;}
+      }else if(!result.matchedCount)return res.status(409).json({message:'Biểu phí đã thay đổi. Vui lòng tải lại.'});
+      await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'MERCHANT_FEES_CHANGED',entityType:'COMMERCE_SETTINGS',entityId:MERCHANT_FEE_CONFIG_ID,before:{revision:old.revision,rules:old.rules},after:next,createdAt:new Date()});
+      return res.json({revision:next.revision,rules:next.rules,updatedAt:next.updatedAt});
+    }catch(e){return res.status(e.statusCode||500).json({message:e.message});}
+  });
   r.get('/delivery-policy',permit('orders.view'),async(_req,res)=>{try{res.json({policy:await getDeliveryPolicy(getDb())});}catch(e){res.status(500).json({message:e.message});}});
   r.put('/delivery-policy',permit('orders.policy.manage'),async(req,res)=>{try{const db=getDb(),now=new Date();const current=await getDeliveryPolicy(db);const policy={standard:normalizeFeeRule(req.body?.standard,current.standard),priority:normalizeFeeRule(req.body?.priority,current.priority),fragile:normalizeFeeRule(req.body?.fragile,current.fragile),cod:{enabled:Boolean(req.body?.cod?.enabled),requireKyc:req.body?.cod?.requireKyc!==false},updatedAt:now,updatedBy:req.admin._id};await db.collection('commerce_settings').updateOne({_id:'DELIVERY_FEE_POLICY'},{$set:policy},{upsert:true});await db.collection('audit_logs').insertOne({actorType:'ADMIN',actorId:req.admin._id,action:'DELIVERY_POLICY_UPDATE',entityType:'COMMERCE_SETTING',entityId:'DELIVERY_FEE_POLICY',after:policy,createdAt:now});res.json({policy});}catch(e){res.status(400).json({message:e.message});}});
   r.get('/merchants',permit('merchants.view'),async(req,res)=>{try{const rows=await getDb().collection('merchants').find({}).sort({createdAt:-1}).limit(500).toArray();res.json({merchants:rows.map(adminMerchantRecord)});}catch(e){res.status(500).json({message:e.message});}});
