@@ -155,8 +155,17 @@ function createAdminOpsRouter({ getDb }) {
         { $set: { adminArchivedAt: at, adminArchivedBy: req.admin._id, adminArchiveReason: reason, updatedAt: at } },
       );
       if (!changed.modifiedCount) return res.status(409).json({ message: 'Trạng thái chuyến vừa thay đổi. Hãy tải lại.' });
+      // The booking is archived first. Even if a worker was active, all new
+      // leases/dispatch transitions now fail the adminArchivedAt guard.
+      // Close any stale offers so a Driver cannot accept an archived trip.
+      const cleanup = await Promise.allSettled([
+        db.collection('booking_offers_v69').updateMany({ bookingId: id, status: 'PENDING' }, { $set: { status: 'CANCELLED', reason: 'BOOKING_ADMIN_ARCHIVED', respondedAt: at, updatedAt: at } }),
+        db.collection('dispatch_rounds_v69').updateMany({ bookingId: id, status: 'WAITING' }, { $set: { status: 'CANCELLED', reason: 'BOOKING_ADMIN_ARCHIVED', completedAt: at } }),
+      ]);
+      const cleanupError = cleanup.filter(x => x.status === 'rejected').map(x => String(x.reason?.message || x.reason)).join('; ');
+      if (cleanupError) console.error('[BOOKING ARCHIVE cleanup]', String(id), cleanupError);
       await db.collection('audit_logs').insertOne({ actorType: 'ADMIN', actorId: req.admin._id, action: 'BOOKING_ADMIN_ARCHIVE', entityType: 'BOOKING', entityId: String(id), after: { status, reason }, createdAt: at }).catch(error=>console.error('[TRIP ARCHIVE AUDIT]', error));
-      return res.json({ ok: true, archivedAt: at.toISOString(), id: String(id) });
+      return res.json({ ok: true, archivedAt: at.toISOString(), id: String(id), warning: cleanupError ? 'Lưu trữ thành công; cần kiểm tra log thu hồi offer: ' + cleanupError : undefined });
     } catch (error) { return res.status(500).json({ message: 'Không thể lưu trữ chuyến. ' + error.message }); }
   });
 

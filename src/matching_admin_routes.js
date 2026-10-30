@@ -125,7 +125,10 @@ function createMatchingAdminRouter({ getDb, getMatching }) {
     try {
       const db = getDb();
       const limit = Math.max(1, Math.min(100, Number(req.query.limit || 30)));
-      const rows = await db.collection('bookings').find({ status: { $in: ['SEARCHING', 'OFFERED', 'NO_DRIVER'] } })
+      const rows = await db.collection('bookings').find({
+        status: { $in: ['SEARCHING', 'OFFERED', 'NO_DRIVER'] },
+        adminArchivedAt: { $exists: false },
+      })
         .sort({ createdAt: 1 }).limit(limit).toArray();
       return res.json(rows.map((b) => ({
         id: String(b._id),
@@ -142,14 +145,26 @@ function createMatchingAdminRouter({ getDb, getMatching }) {
     } catch (error) { return res.status(500).json({ message: error.message }); }
   });
 
-  router.get('/candidates/:bookingId', canView, async (req, res) => {
+  // Matching Center must never preview or dispatch an archived trip.
+  async function ensureNotArchived(req, res, next) {
+    const bookingId = safeObjectId(req.params.bookingId);
+    if (!bookingId) return res.status(400).json({ message: 'Booking id không hợp lệ.' });
+    try {
+      const b = await getDb().collection('bookings').findOne({ _id: bookingId }, { projection: { adminArchivedAt: 1 } });
+      if (!b) return res.status(404).json({ message: 'Không tìm thấy chuyến.' });
+      if (b.adminArchivedAt) return res.status(409).json({ code: 'BOOKING_ADMIN_ARCHIVED', message: 'Chuyến đã lưu trữ, không được tiếp tục điều phối.' });
+      return next();
+    } catch (e) { return res.status(500).json({ message: e.message }); }
+  }
+
+  router.get('/candidates/:bookingId', canView, ensureNotArchived, async (req, res) => {
     try {
       const result = await engine().previewCandidates(req.params.bookingId, { includeNoGps: true });
       return res.json(result);
     } catch (error) { return res.status(400).json({ message: error.message }); }
   });
 
-  router.post('/dispatch/:bookingId', canDispatch, async (req, res) => {
+  router.post('/dispatch/:bookingId', canDispatch, ensureNotArchived, async (req, res) => {
     try {
       const driverId = String(req.body?.driverId || '').trim();
       const reason = String(req.body?.reason || '').trim();
@@ -171,7 +186,7 @@ function createMatchingAdminRouter({ getDb, getMatching }) {
     } catch (error) { return res.status(400).json({ message: error.message }); }
   });
 
-  router.post('/cancel-offer/:bookingId', canDispatch, async (req, res) => {
+  router.post('/cancel-offer/:bookingId', canDispatch, ensureNotArchived, async (req, res) => {
     try {
       const reason = String(req.body?.reason || 'ADMIN_CANCELLED_OFFER').trim();
       const result = await engine().cancelActiveOffersForBooking(req.params.bookingId, reason, req.admin._id);

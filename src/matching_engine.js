@@ -1121,6 +1121,7 @@ function createMatchingEngine({
     if (!bookingId) throw new Error('Booking id không hợp lệ.');
     const booking = await db.collection('bookings').findOne({ _id: bookingId });
     if (!booking) throw new Error('Không tìm thấy chuyến.');
+    if (booking.adminArchivedAt) throw Object.assign(new Error('Chuyến đã được lưu trữ, không thể phát đơn.'), { code: 'BOOKING_ADMIN_ARCHIVED' });
 
     const policy = await getMatchingPolicy();
     const emptyExcluded = new Set();
@@ -1388,6 +1389,7 @@ function createMatchingEngine({
     const booking = await db.collection('bookings').findOne({
       _id: offer.bookingId,
       status: 'SEARCHING',
+      adminArchivedAt: { $exists: false },
       'dispatch.currentDriverId': driverId,
     });
 
@@ -1786,7 +1788,7 @@ function createMatchingEngine({
       return dispatch.resumeSearchingBookings();
     }
 
-    const bookings = await db.collection('bookings').find({ status: 'SEARCHING' })
+    const bookings = await db.collection('bookings').find({ status: 'SEARCHING', adminArchivedAt: { $exists: false } })
       .sort({ createdAt: 1 }).limit(200).toArray();
     for (const booking of bookings) {
       dispatchBooking(booking._id).catch((error) => {
@@ -1963,7 +1965,7 @@ function createMatchingEngine({
       db.collection('driver_locations').countDocuments({
         updatedAt: { $gte: new Date(Date.now() - config.locationFreshSeconds * 1000) },
       }),
-      db.collection('bookings').countDocuments({ status: 'SEARCHING' }),
+      db.collection('bookings').countDocuments({ status: 'SEARCHING', adminArchivedAt: { $exists: false } }),
       db.collection('driver_offers').countDocuments({
         status: 'SENT',
         expiresAt: { $gt: nowDate },

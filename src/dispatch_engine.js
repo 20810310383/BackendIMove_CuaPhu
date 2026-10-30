@@ -163,6 +163,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     const leaseUntil = new Date(now.getTime() + 90000);
     const claim = await getDb().collection('bookings').updateOne(
       { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED', 'NO_DRIVER'] },
+        adminArchivedAt: { $exists: false },
         $or: [
           { 'dispatchEngine.claimUntil': { $exists: false } },
           { 'dispatchEngine.claimUntil': { $lte: now } },
@@ -192,10 +193,11 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     if (booking.adminArchivedAt) return { skipped: true, reason: 'BOOKING_ADMIN_ARCHIVED' };
     if (booking.status === 'NO_DRIVER' && (reset || adminId)) {
       await db.collection('bookings').updateOne(
-        { _id: bookingId, status: 'NO_DRIVER' },
+        { _id: bookingId, status: 'NO_DRIVER', adminArchivedAt: { $exists: false } },
         { $set: { status: 'SEARCHING', updatedAt: new Date(), 'dispatchEngine.status': 'REQUEUED' }, $unset: { 'dispatchEngine.completedAt': '' } },
       );
       booking = await db.collection('bookings').findOne({ _id: bookingId });
+      if (!booking || booking.adminArchivedAt) return { skipped: true, reason: 'BOOKING_ADMIN_ARCHIVED' };
     }
     if (!['SEARCHING', 'OFFERED'].includes(booking.status)) return { skipped: true, status: booking.status };
     // Vòng WAITING còn hạn: sweep/REST/Admin không được phát thêm một vòng song song.
@@ -231,7 +233,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     if (bookingAgeMs >= bookingSearchTimeoutSeconds * 1000) {
       clearRetryTimer(bookingId);
       await db.collection('bookings').updateOne(
-        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
+        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, adminArchivedAt: { $exists: false } },
         { $set: { status: 'NO_DRIVER', 'dispatchEngine.status': 'NO_DRIVER', 'dispatchEngine.completedAt': new Date(), updatedAt: new Date() } },
       );
       await event(bookingId, 'NO_DRIVER', { reason: 'SEARCH_TIMEOUT', bookingSearchTimeoutSeconds });
@@ -244,7 +246,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       const retryDelay = Math.max(3, Number(cfg.retry?.retryDelaySeconds?.[0] || 5));
       const nextRetryAt = new Date(Date.now() + retryDelay * 1000);
       await db.collection('bookings').updateOne(
-        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
+        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, adminArchivedAt: { $exists: false } },
         { $set: { status: 'SEARCHING', 'dispatchEngine.version': dispatchVersion, 'dispatchEngine.currentRound': 0, 'dispatchEngine.status': 'WAITING_DRIVER', 'dispatchEngine.nextRetryAt': nextRetryAt, updatedAt: new Date() } },
       );
       await event(bookingId, 'DISPATCH_CYCLE_EMPTY', { round: nextRound - 1, dispatchVersion, nextRetryAt });
@@ -287,7 +289,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       const delaySeconds = Math.max(2, Math.min(10, Number(cfg.retry?.retryDelaySeconds?.[0] || 3)));
       const nextRetryAt = new Date(Date.now() + delaySeconds * 1000);
       const pendingChange = await db.collection('bookings').updateOne(
-        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
+        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, adminArchivedAt: { $exists: false } },
         { $set: { status: 'SEARCHING', 'dispatchEngine.version': dispatchVersion, 'dispatchEngine.currentRound': nextRound, 'dispatchEngine.status': 'WAITING_NEXT_ROUND', 'dispatchEngine.nextRetryAt': nextRetryAt, updatedAt: new Date() } },
       );
       if (!pendingChange.modifiedCount) return { skipped: true, reason: 'BOOKING_STATE_CHANGED' };
@@ -329,7 +331,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
         ).catch(() => {});
       }
     }
-    await db.collection('bookings').updateOne({ _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } }, { $set: { status: 'OFFERED', 'dispatchEngine.version': dispatchVersion, 'dispatchEngine.currentRound': nextRound, 'dispatchEngine.status': 'WAITING', 'dispatchEngine.roundExpiresAt': expiresAt, 'dispatchEngine.startedAt': booking.dispatchEngine?.startedAt || now, 'dispatchEngine.updatedAt': now, updatedAt: now } });
+    await db.collection('bookings').updateOne({ _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, adminArchivedAt: { $exists: false } }, { $set: { status: 'OFFERED', 'dispatchEngine.version': dispatchVersion, 'dispatchEngine.currentRound': nextRound, 'dispatchEngine.status': 'WAITING', 'dispatchEngine.roundExpiresAt': expiresAt, 'dispatchEngine.startedAt': booking.dispatchEngine?.startedAt || now, 'dispatchEngine.updatedAt': now, updatedAt: now } });
     await event(bookingId, 'ROUND_STARTED', { round: nextRound, dispatchVersion, candidateCount: candidates.length, candidateSource, expiresAt, adminId });
     return { bookingId: String(bookingId), dispatchVersion, round: nextRound, candidates: candidates.length, candidateSource, expiresAt };
   }
@@ -357,7 +359,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       const max = Math.max(0, Number(cfg.retry?.maxDispatchRetries ?? 3));
       if (attempt >= max) {
         await getDb().collection('bookings').updateOne(
-          { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
+          { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, adminArchivedAt: { $exists: false } },
           { $set: { 'dispatchEngine.status': 'ERROR', 'dispatchEngine.lastError': error.message, updatedAt: new Date() } },
         ).catch(() => {});
         await event(bookingId, 'DISPATCH_FAILED', { attempt, message: error.message });
@@ -376,7 +378,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
         { $set: { status: 'CANCELLED', reason: 'DISPATCH_RETRY', completedAt: new Date() } },
       ).catch(() => {});
       await db.collection('bookings').updateOne(
-        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
+        { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, adminArchivedAt: { $exists: false } },
         { $set: {
           status: 'SEARCHING',
           'dispatchEngine.status': 'RETRY_WAIT',
@@ -459,7 +461,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       const vehicle = await db.collection('vehicles').findOne({ driverId, status: 'APPROVED', $or: [{ serviceCodes: serviceCode }, { serviceCode }] }, opts);
       if (!vehicle) throw Object.assign(new Error('Phương tiện tài xế không phù hợp loại dịch vụ.'), { code: 'SERVICE_NOT_ELIGIBLE' });
       const user = await db.collection('users').findOne({ _id: driver.userId }, opts);
-      const result = await db.collection('bookings').findOneAndUpdate({ _id: offer.bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, driverId: null }, { $set: { status: 'DRIVER_ASSIGNED', driverId, vehicleId: vehicle?._id || null, driverSnapshot: { fullName: user?.fullName || 'Tài xế', phone: user?.phone || '', rating: Number(driver.rating || 5), vehiclePlate: vehicle?.plateNumber || '', vehicleBrand: vehicle?.brand || '', vehicleModel: vehicle?.model || '', vehicleColor: vehicle?.color || '' }, assignedAt: now, updatedAt: now, 'dispatchEngine.status': 'ASSIGNED', 'dispatchEngine.acceptedOfferId': _id, 'dispatchEngine.assignedAt': now } }, { ...opts, returnDocument: 'after' });
+      const result = await db.collection('bookings').findOneAndUpdate({ _id: offer.bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, driverId: null, adminArchivedAt: { $exists: false } }, { $set: { status: 'DRIVER_ASSIGNED', driverId, vehicleId: vehicle?._id || null, driverSnapshot: { fullName: user?.fullName || 'Tài xế', phone: user?.phone || '', rating: Number(driver.rating || 5), vehiclePlate: vehicle?.plateNumber || '', vehicleBrand: vehicle?.brand || '', vehicleModel: vehicle?.model || '', vehicleColor: vehicle?.color || '' }, assignedAt: now, updatedAt: now, 'dispatchEngine.status': 'ASSIGNED', 'dispatchEngine.acceptedOfferId': _id, 'dispatchEngine.assignedAt': now } }, { ...opts, returnDocument: 'after' });
       const booking = result?._id ? result : result?.value;
       if (!booking) throw Object.assign(new Error('Chuyến đã được tài xế khác nhận.'), { code: 'BOOKING_ALREADY_ACCEPTED' });
       await db.collection('drivers').updateOne({ _id: driverId, onlineStatus: 'ONLINE', $or: [{ activeBookingId: null }, { activeBookingId: { $exists: false } }] }, { $set: { onlineStatus: 'BUSY', activeBookingId: offer.bookingId, updatedAt: now } }, opts);
@@ -612,8 +614,9 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
     const bookingId = oid(rawBookingId), driverId = oid(rawDriverId); if (!bookingId || !driverId) throw new Error('ID không hợp lệ.');
     let booking = await getDb().collection('bookings').findOne({ _id: bookingId }); if (!booking || booking.adminArchivedAt || !['SEARCHING', 'OFFERED', 'NO_DRIVER'].includes(booking.status)) throw new Error('Chuyến không còn ở trạng thái có thể điều phối.');
     if (booking.status === 'NO_DRIVER') {
-      await getDb().collection('bookings').updateOne({ _id: bookingId, status: 'NO_DRIVER' }, { $set: { status: 'SEARCHING', updatedAt: new Date(), 'dispatchEngine.status': 'ADMIN_REQUEUED' }, $unset: { 'dispatchEngine.completedAt': '' } });
+      await getDb().collection('bookings').updateOne({ _id: bookingId, status: 'NO_DRIVER', adminArchivedAt: { $exists: false } }, { $set: { status: 'SEARCHING', updatedAt: new Date(), 'dispatchEngine.status': 'ADMIN_REQUEUED' }, $unset: { 'dispatchEngine.completedAt': '' } });
       booking = await getDb().collection('bookings').findOne({ _id: bookingId });
+      if (!booking || booking.adminArchivedAt || booking.status !== 'SEARCHING') throw new Error('Chuyến đã lưu trữ hoặc không còn được phép phát.');
     }
     const driver = await getDb().collection('drivers').findOne({ _id: driverId, onlineStatus: 'ONLINE', approvalStatus: 'APPROVED', kycStatus: 'APPROVED' }); if (!driver || driver.activeBookingId) throw new Error('Tài xế không sẵn sàng.');
     const serviceCode = String(booking.serviceCode || 'BIKE').toUpperCase();
@@ -659,7 +662,7 @@ function createDispatchEngine({ getDb, getClient, getMatching, notificationServi
       await getDb().collection('booking_offers_v69').updateOne({ _id: offer._id }, { $set: { 'notification.lastError': String(error.message).slice(0, 350) } }).catch(() => {});
     }
     await getDb().collection('bookings').updateOne(
-      { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] } },
+      { _id: bookingId, status: { $in: ['SEARCHING', 'OFFERED'] }, adminArchivedAt: { $exists: false } },
       { $set: { status: 'OFFERED', 'dispatchEngine.status': 'WAITING', 'dispatchEngine.roundExpiresAt': expiresAt, updatedAt: new Date() } },
     );
     await event(bookingId, 'ADMIN_MANUAL_OFFER', { driverId, offerId: offer._id, adminId }); return { ok: true, offerId: String(offer._id), expiresAt };
