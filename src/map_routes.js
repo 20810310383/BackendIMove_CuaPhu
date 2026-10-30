@@ -17,11 +17,22 @@ function createMapRouter({ mapService = createMapService() } = {}) {
 
   router.get('/search', async (req, res) => {
     try {
-      const results = await mapService.search(req.query.q, { limit: req.query.limit, countryCode: req.query.country || 'vn', focusLat: req.query.lat, focusLon: req.query.lon });
+      const results = await mapService.search(req.query.q, { limit: req.query.limit, countryCode: req.query.country || 'vn', focusLat: req.query.lat, focusLon: req.query.lon, clientVersion: req.query.v === '2' ? 2 : 1 });
       return res.json({ provider: results[0]?.provider || mapService.publicConfig().geocodingProvider, results });
     } catch (error) {
       const status = error instanceof RangeError || error instanceof TypeError ? 400 : 502;
       return res.status(status).json({ code: 'MAP_SEARCH_FAILED', message: error.message });
+    }
+  });
+
+  // Resolve VietMap opaque ref only when user taps an Autocomplete result.
+  router.get('/place', async (req, res) => {
+    try {
+      const place = await mapService.placeDetails(req.query.placeId);
+      return res.json({ provider: place.provider, place });
+    } catch (error) {
+      const status = error instanceof RangeError || error instanceof TypeError ? 400 : 502;
+      return res.status(status).json({ code: 'MAP_PLACE_FAILED', message: error.message });
     }
   });
 

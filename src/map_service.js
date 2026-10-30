@@ -34,8 +34,6 @@ function normalizeSearchResults(items, query = '') {
         latitude,
         longitude,
         type: String(item?.type || item?.category || 'place'),
-        provider: 'OPENSTREETMAP',
-        matchQuality: houseMatchQuality(query, item?.address?.house_number, display),
       };
     })
     .filter(Boolean);
@@ -114,6 +112,53 @@ function normalizeTrackAsiaReverse(payload, latitude, longitude) {
   return { ...places[0], matchQuality: 'NEARBY' };
 }
 
+// VIETMAP V4: autocomplete is suggestion-only (NO coordinates).
+// Always resolve a selected ref_id with Place V4 before using it for a booking.
+function normalizeVietMapSuggestions(payload, query = '') {
+  const items = Array.isArray(payload) ? payload : [];
+  const seen = new Set();
+  return items.map((item) => {
+    const refId = String(item?.ref_id || '').trim();
+    const address = String(item?.display || item?.address || '').trim();
+    if (!/^(auto|geocode):[A-Za-z0-9_:\-]+$/.test(refId) || !address || seen.has(refId)) return null;
+    seen.add(refId);
+    const name = String(item?.name || '').trim() || address.split(',')[0].trim();
+    return {
+      placeId: `vietmap:${refId}`,
+      name, address,
+      latitude: null, longitude: null, // Place V4 resolves these ONLY on selection
+      type: 'place', provider: 'VIETMAP',
+      // Text similarity is NOT proof of rooftop accuracy.
+      matchQuality: queryHouseNumber(query) ? 'HOUSE_CANDIDATE' : 'PLACE',
+    };
+  }).filter(Boolean);
+}
+
+function normalizeVietMapPlace(item, placeId = 'vietmap:unknown') {
+  const point = assertLatLon(item?.lat, item?.lng);
+  const address = String(item?.display || item?.address || '').trim();
+  const name = String(item?.name || '').trim() || address.split(',')[0].trim();
+  if (!address) throw new Error('VietMap Place returned no address');
+  return {
+    placeId, name: name || address, address,
+    latitude: point.latitude, longitude: point.longitude,
+    type: 'place', provider: 'VIETMAP', matchQuality: 'NEARBY',
+  };
+}
+
+function normalizeVietMapReverse(payload, latitude, longitude) {
+  const items = Array.isArray(payload) ? payload : payload && typeof payload === 'object' ? [payload] : [];
+  const place = items.find((x) => x && (x.display || x.address));
+  if (!place) return null;
+  const address = String(place.display || place.address).trim();
+  return {
+    placeId: `vietmap:pin:${Number(latitude).toFixed(6)},${Number(longitude).toFixed(6)}`,
+    name: String(place.name || '').trim() || address.split(',')[0].trim() || address,
+    address, latitude: Number(latitude), longitude: Number(longitude),
+    type: 'place', provider: 'VIETMAP', matchQuality: 'NEARBY',
+  };
+}
+
 function normalizeRoute(payload, mode = 'BALANCED') {
   const routes = Array.isArray(payload?.routes) ? payload.routes.filter(Boolean) : [];
   const normalizedMode = String(mode || 'BALANCED').toUpperCase();
@@ -183,30 +228,34 @@ function createMapService(options = {}) {
   const geocodingBaseUrl = trimBaseUrl(options.geocodingBaseUrl || process.env.OSM_GEOCODING_URL, DEFAULT_GEOCODING_URL);
   const routingBaseUrl = trimBaseUrl(options.routingBaseUrl || process.env.OSM_ROUTING_URL, DEFAULT_ROUTING_URL);
   const tileUrl = String(options.tileUrl || process.env.OSM_TILE_URL || DEFAULT_TILE_URL).trim();
-  const userAgent = String(options.userAgent || process.env.OSM_USER_AGENT || 'TH79-iMove/1.6.0 (+https://daututh79.com)').trim();
+  const userAgent = String(options.userAgent || process.env.OSM_USER_AGENT || 'TH79-iMove (+https://daututh79.com)').trim();
   const timeoutMs = Math.max(1000, Number(options.timeoutMs || process.env.OSM_HTTP_TIMEOUT_MS || 7000));
-  const cacheMs = Math.max(0, Number(options.cacheMs || process.env.OSM_GEOCODE_CACHE_MS || 300000));
+  const cacheMs = Math.max(0, Number(options.cacheMs ?? process.env.OSM_GEOCODE_CACHE_MS ?? 300000));
   const cache = new Map();
-  const trackAsiaKey = String(options.trackAsiaKey ?? process.env.TRACKASIA_API_KEY ?? '').trim();
-  const trackAsiaBaseUrl = trimBaseUrl(options.trackAsiaBaseUrl || process.env.TRACKASIA_API_BASE_URL, 'https://maps.track-asia.com');
+  const vietMapKey = String(options.vietMapKey ?? process.env.VIETMAP_API_KEY ?? '').trim();
+  const vietMapBaseUrl = trimBaseUrl(options.vietMapBaseUrl || process.env.VIETMAP_API_BASE_URL, 'https://maps.vietmap.vn');
+  // Do not silently put a vendor key into an untrusted endpoint.
+  if (!/^https:\/\//i.test(vietMapBaseUrl)) throw new Error('VIETMAP_API_BASE_URL must use HTTPS');
+  const requestedProvider = String(options.searchProvider ?? process.env.MAP_SEARCH_PROVIDER ?? (vietMapKey ? 'VIETMAP' : 'OSM')).toUpperCase();
+  const searchProvider = requestedProvider === 'VIETMAP' && vietMapKey ? 'VIETMAP' : 'OPENSTREETMAP';
+  const fallbackToOsm = String(options.fallbackToOsm ?? process.env.VIETMAP_OSM_FALLBACK ?? 'true').toLowerCase() !== 'false';
 
   async function requestJson(url) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const response = await fetchImpl(url, {
-        headers: {
-          Accept: 'application/json',
-          'Accept-Language': 'vi,en;q=0.8',
-          'User-Agent': userAgent,
-        },
+        headers: { Accept: 'application/json', 'Accept-Language': 'vi,en;q=0.8', 'User-Agent': userAgent },
         signal: controller.signal,
       });
-      if (!response.ok) throw new Error(`Map provider HTTP ${response.status}`);
+      // Do not log the full URL (it contains the provider key).
+      if (!response.ok) {
+        const error = new Error(`Map provider HTTP ${response.status}`);
+        error.httpStatus = response.status;
+        throw error;
+      }
       return await response.json();
-    } finally {
-      clearTimeout(timer);
-    }
+    } finally { clearTimeout(timer); }
   }
 
   async function cached(key, factory) {
@@ -214,78 +263,71 @@ function createMapService(options = {}) {
     if (existing && existing.expiresAt > Date.now()) return existing.value;
     const value = await factory();
     if (cacheMs > 0) cache.set(key, { value, expiresAt: Date.now() + cacheMs });
-    if (cache.size > 500) {
-      const first = cache.keys().next().value;
-      cache.delete(first);
-    }
+    if (cache.size > 500) cache.delete(cache.keys().next().value);
     return value;
   }
 
-  async function search(query, { limit = 5, countryCode = 'vn', focusLat, focusLon } = {}) {
+  async function osmSearch(q, safeLimit, countryCode) {
+    const params = new URLSearchParams({ q, format: 'jsonv2', addressdetails: '1', namedetails: '1', limit: String(safeLimit) });
+    if (countryCode) params.set('countrycodes', String(countryCode).toLowerCase());
+    return normalizeSearchResults(await requestJson(`${geocodingBaseUrl}/search?${params}`), q).slice(0, safeLimit).map(x => ({...x, provider: 'OPENSTREETMAP', matchQuality: houseMatchQuality(q, '', x.address)}));
+  }
+
+  async function search(query, { limit = 6, countryCode = 'vn', focusLat, focusLon, clientVersion = 2 } = {}) {
     const q = String(query || '').trim();
     if (q.length < 2) return [];
     if (q.length > 120) throw new RangeError('query is too long');
-    const safeLimit = Math.min(8, Math.max(1, Number(limit) || 5));
-    const focus = Number.isFinite(Number(focusLat)) && Number.isFinite(Number(focusLon)) &&
-      focusLat !== undefined && focusLon !== undefined ? assertLatLon(focusLat, focusLon) : null;
-    const cacheKey = `s:${q.toLowerCase()}:${safeLimit}:${countryCode}:${focus ? `${focus.latitude.toFixed(3)},${focus.longitude.toFixed(3)}` : ''}:${Boolean(trackAsiaKey)}`;
+    const safeLimit = Math.min(10, Math.max(1, Number(limit) || 6));
+    const focus = focusLat !== undefined && focusLon !== undefined && focusLat !== '' && focusLon !== ''
+      ? assertLatLon(focusLat, focusLon) : null;
+    // Older released APKs assume every /search result already has coordinates.
+    // Keep the original OSM response for them until they are upgraded.
+    if (Number(clientVersion) < 2) return osmSearch(q, safeLimit, countryCode);
+    const cacheKey = `s:${searchProvider}:${q.toLowerCase()}:${safeLimit}:${countryCode}:${focus ? `${focus.latitude.toFixed(3)},${focus.longitude.toFixed(3)}` : ''}`;
     return cached(cacheKey, async () => {
-      if (trackAsiaKey) {
-        // Exact-address entry -> TrackAsia Search. Partial entry -> Autocomplete.
-        const endpoint = queryHouseNumber(q) ? '/api/v1/search' : '/api/v1/autocomplete';
-        const params = new URLSearchParams({ text: q, lang: 'vi', size: String(safeLimit), key: trackAsiaKey, new_admin: 'true', include_old_admin: 'true' });
-        if (focus) {
-          params.set('focus.point.lat', String(focus.latitude));
-          params.set('focus.point.lon', String(focus.longitude));
-        }
+      if (searchProvider === 'VIETMAP') {
+        const params = new URLSearchParams({ apikey: vietMapKey, text: q, display_type: '5' });
+        if (focus) params.set('focus', `${focus.latitude},${focus.longitude}`);
         try {
-          const payload = await requestJson(`${trackAsiaBaseUrl}${endpoint}?${params}`);
-          const results = normalizeTrackAsiaResults(payload, q);
-          if (results.length) return results.slice(0, safeLimit);
+          const results = normalizeVietMapSuggestions(await requestJson(`${vietMapBaseUrl}/api/autocomplete/v4?${params}`), q);
+          if (results.length || !fallbackToOsm) return results.slice(0, safeLimit);
         } catch (error) {
-          // Never log a URL with an API key. Old OSM is fallback, not primary.
-          console.warn('[iMove Maps] TrackAsia search unavailable:', String(error.message).slice(0, 120));
+          if (!fallbackToOsm) throw new Error(`VietMap Autocomplete unavailable (${error.httpStatus || 'NETWORK'})`);
+          console.warn('[iMove Maps] VietMap Autocomplete unavailable:', error.httpStatus || 'NETWORK');
         }
       }
-      const params = new URLSearchParams({ q, format: 'jsonv2', addressdetails: '1', namedetails: '1', limit: String(safeLimit) });
-      if (countryCode) params.set('countrycodes', String(countryCode).toLowerCase());
-      const results = normalizeSearchResults(await requestJson(`${geocodingBaseUrl}/search?${params}`), q);
-      return results.slice(0, safeLimit);
+      return osmSearch(q, safeLimit, countryCode);
+    });
+  }
+
+  async function placeDetails(placeId) {
+    const id = String(placeId || '').trim();
+    if (!id.startsWith('vietmap:')) throw new RangeError('Unsupported Place ID');
+    const refid = id.slice('vietmap:'.length);
+    if (refid.length > 2048 || !/^(auto|geocode):[A-Za-z0-9_:\-]+$/.test(refid)) throw new RangeError('Invalid VietMap Place ref_id');
+    if (!vietMapKey) throw new Error('VIETMAP_API_KEY is not configured');
+    return cached(`place:${refid}`, async () => {
+      const params = new URLSearchParams({ apikey: vietMapKey, refid });
+      return normalizeVietMapPlace(await requestJson(`${vietMapBaseUrl}/api/place/v4?${params}`), id);
     });
   }
 
   async function reverse(latitude, longitude) {
     const point = assertLatLon(latitude, longitude);
-    const cacheKey = `r:${point.latitude.toFixed(5)},${point.longitude.toFixed(5)}:${Boolean(trackAsiaKey)}`;
+    const cacheKey = `r:${searchProvider}:${point.latitude.toFixed(5)},${point.longitude.toFixed(5)}`;
     return cached(cacheKey, async () => {
-      if (trackAsiaKey) {
-        const params = new URLSearchParams({
-          'point.lat': String(point.latitude),
-          'point.lon': String(point.longitude),
-          'size': '5',
-          'lang': 'vi',
-          'new_admin': 'true',
-          'include_old_admin': 'true',
-          'key': trackAsiaKey,
-        });
+      if (searchProvider === 'VIETMAP') {
+        const params = new URLSearchParams({ apikey: vietMapKey, lat: String(point.latitude), lng: String(point.longitude), display_type: '5' });
         try {
-          const result = normalizeTrackAsiaReverse(
-            await requestJson(`${trackAsiaBaseUrl}/api/v1/reverse?${params}`),
-            point.latitude, point.longitude,
-          );
-          if (result) return result;
+          const found = normalizeVietMapReverse(await requestJson(`${vietMapBaseUrl}/api/reverse/v4?${params}`), point.latitude, point.longitude);
+          if (found || !fallbackToOsm) return found;
         } catch (error) {
-          console.warn('[iMove Maps] TrackAsia reverse unavailable:', String(error.message).slice(0, 120));
+          if (!fallbackToOsm) throw new Error(`VietMap Reverse unavailable (${error.httpStatus || 'NETWORK'})`);
+          console.warn('[iMove Maps] VietMap Reverse unavailable:', error.httpStatus || 'NETWORK');
         }
       }
-      const params = new URLSearchParams({
-        lat: String(point.latitude), lon: String(point.longitude),
-        format: 'jsonv2', addressdetails: '1', namedetails: '1', zoom: '18',
-      });
-      return normalizeReverseResult(
-        await requestJson(`${geocodingBaseUrl}/reverse?${params}`),
-        point.latitude, point.longitude,
-      );
+      const params = new URLSearchParams({ lat: String(point.latitude), lon: String(point.longitude), format: 'jsonv2', addressdetails: '1', namedetails: '1', zoom: '18' });
+      return normalizeReverseResult(await requestJson(`${geocodingBaseUrl}/reverse?${params}`), point.latitude, point.longitude);
     });
   }
 
@@ -300,23 +342,22 @@ function createMapService(options = {}) {
     const params = new URLSearchParams({ overview: 'full', geometries: 'geojson', steps: 'true', alternatives: 'true' });
     const result = normalizeRoute(await requestJson(`${routingBaseUrl}${path}?${params}`), mode);
     return { ...result, vehicleType, routeMode: mode, routingProfile: profile };
-
   }
 
   function publicConfig() {
     return {
-      provider: trackAsiaKey ? 'TRACKASIA' : 'OPENSTREETMAP',
-      geocodingProvider: trackAsiaKey ? 'TRACKASIA' : 'OPENSTREETMAP',
+      // TrackAsia map rendering lives in Flutter TrackAsiaMapView, unchanged.
+      provider: 'OPENSTREETMAP', // retains backend tile/routing metadata from original V9
+      displayMapProvider: 'TRACKASIA', // Flutter TrackAsia SDK unchanged
+      geocodingProvider: searchProvider,
       tileUrl,
       attribution: '© OpenStreetMap contributors',
-      geocodingViaBackend: true,
-      routingViaBackend: true,
-      routeModes: ['BALANCED','FASTEST','SHORTEST'],
-      vehicleTypes: ['MOTORBIKE','CAR','VAN','TRUCK'],
+      geocodingViaBackend: true, routingViaBackend: true,
+      routeModes: ['BALANCED', 'FASTEST', 'SHORTEST'],
+      vehicleTypes: ['MOTORBIKE', 'CAR', 'VAN', 'TRUCK'],
     };
   }
-
-  return { search, reverse, route, publicConfig };
+  return { search, placeDetails, reverse, route, publicConfig };
 }
 
 module.exports = {
@@ -324,6 +365,9 @@ module.exports = {
   normalizeSearchResults,
   normalizeReverseResult,
   normalizeTrackAsiaResults,
+  normalizeVietMapSuggestions,
+  normalizeVietMapPlace,
+  normalizeVietMapReverse,
   queryHouseNumber,
   houseMatchQuality,
   normalizeRoute,
