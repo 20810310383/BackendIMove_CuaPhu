@@ -18,10 +18,21 @@ function createMapRouter({ mapService = createMapService() } = {}) {
   router.get('/search', async (req, res) => {
     try {
       const results = await mapService.search(req.query.q, { limit: req.query.limit, countryCode: req.query.country || 'vn', focusLat: req.query.lat, focusLon: req.query.lon, clientVersion: req.query.v === '2' ? 2 : 1 });
-      return res.json({ provider: results[0]?.provider || mapService.publicConfig().geocodingProvider, results });
+      const requestedProvider = mapService.publicConfig().geocodingProvider;
+      const provider = results[0]?.provider || requestedProvider;
+      return res.json({
+        provider, requestedProvider,
+        usedFallback: Boolean(results.length && requestedProvider !== provider),
+        results,
+      });
     } catch (error) {
-      const status = error instanceof RangeError || error instanceof TypeError ? 400 : 502;
-      return res.status(status).json({ code: 'MAP_SEARCH_FAILED', message: error.message });
+      const status = error.code === 'APP_UPDATE_REQUIRED' ? 426
+        : error.code === 'VIETMAP_NOT_CONFIGURED' ? 503
+        : error instanceof RangeError || error instanceof TypeError ? 400 : 502;
+      return res.status(status).json({
+        code: error.code || 'MAP_SEARCH_FAILED', message: error.message,
+        requestedProvider: mapService.publicConfig().geocodingProvider,
+      });
     }
   });
 
@@ -32,7 +43,7 @@ function createMapRouter({ mapService = createMapService() } = {}) {
       return res.json({ provider: place.provider, place });
     } catch (error) {
       const status = error instanceof RangeError || error instanceof TypeError ? 400 : 502;
-      return res.status(status).json({ code: 'MAP_PLACE_FAILED', message: error.message });
+      return res.status(status).json({ code: error.code || 'MAP_PLACE_FAILED', message: error.message, provider: 'VIETMAP' });
     }
   });
 
@@ -42,7 +53,7 @@ function createMapRouter({ mapService = createMapService() } = {}) {
       return res.json({ provider: place?.provider || mapService.publicConfig().geocodingProvider, place });
     } catch (error) {
       const status = error instanceof RangeError || error instanceof TypeError ? 400 : 502;
-      return res.status(status).json({ code: 'MAP_REVERSE_FAILED', message: error.message });
+      return res.status(status).json({ code: error.code || 'MAP_REVERSE_FAILED', message: error.message, provider: 'VIETMAP' });
     }
   });
 

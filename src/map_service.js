@@ -1,6 +1,5 @@
 'use strict';
 
-const DEFAULT_GEOCODING_URL = 'https://nominatim.openstreetmap.org';
 const DEFAULT_ROUTING_URL = 'https://router.project-osrm.org';
 const DEFAULT_TILE_URL = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
 
@@ -120,7 +119,7 @@ function normalizeVietMapSuggestions(payload, query = '') {
   return items.map((item) => {
     const refId = String(item?.ref_id || '').trim();
     const address = String(item?.display || item?.address || '').trim();
-    if (!/^(auto|geocode):[A-Za-z0-9_:\-]+$/.test(refId) || !address || seen.has(refId)) return null;
+    if (!/^(auto|geocode):\S{1,2048}$/.test(refId) || !address || seen.has(refId)) return null;
     seen.add(refId);
     const name = String(item?.name || '').trim() || address.split(',')[0].trim();
     return {
@@ -143,6 +142,10 @@ function normalizeVietMapPlace(item, placeId = 'vietmap:unknown') {
     placeId, name: name || address, address,
     latitude: point.latitude, longitude: point.longitude,
     type: 'place', provider: 'VIETMAP', matchQuality: 'NEARBY',
+    // VietMap's explicit house number and street are used for post-selection
+    // comparison. Never infer a verified house from suggestion text alone.
+    houseNumber: String(item?.hs_num || '').trim(),
+    street: String(item?.street || '').trim(),
   };
 }
 
@@ -225,7 +228,6 @@ function createMapService(options = {}) {
   const fetchImpl = options.fetchImpl || global.fetch;
   if (typeof fetchImpl !== 'function') throw new Error('Global fetch is not available');
 
-  const geocodingBaseUrl = trimBaseUrl(options.geocodingBaseUrl || process.env.OSM_GEOCODING_URL, DEFAULT_GEOCODING_URL);
   const routingBaseUrl = trimBaseUrl(options.routingBaseUrl || process.env.OSM_ROUTING_URL, DEFAULT_ROUTING_URL);
   const tileUrl = String(options.tileUrl || process.env.OSM_TILE_URL || DEFAULT_TILE_URL).trim();
   const userAgent = String(options.userAgent || process.env.OSM_USER_AGENT || 'TH79-iMove (+https://daututh79.com)').trim();
@@ -236,9 +238,11 @@ function createMapService(options = {}) {
   const vietMapBaseUrl = trimBaseUrl(options.vietMapBaseUrl || process.env.VIETMAP_API_BASE_URL, 'https://maps.vietmap.vn');
   // Do not silently put a vendor key into an untrusted endpoint.
   if (!/^https:\/\//i.test(vietMapBaseUrl)) throw new Error('VIETMAP_API_BASE_URL must use HTTPS');
-  const requestedProvider = String(options.searchProvider ?? process.env.MAP_SEARCH_PROVIDER ?? (vietMapKey ? 'VIETMAP' : 'OSM')).toUpperCase();
-  const searchProvider = requestedProvider === 'VIETMAP' && vietMapKey ? 'VIETMAP' : 'OPENSTREETMAP';
-  const fallbackToOsm = String(options.fallbackToOsm ?? process.env.VIETMAP_OSM_FALLBACK ?? 'true').toLowerCase() !== 'false';
+  // VietMap-only policy for address search and reverse-geocoding. Even if old
+  // MAP_SEARCH_PROVIDER / VIETMAP_OSM_FALLBACK values remain in PM2/.env,
+  // geocoding NEVER contacts Nominatim / OpenStreetMap.
+  const searchProvider = 'VIETMAP';
+  const fallbackToOsm = false;
 
   async function requestJson(url) {
     const controller = new AbortController();
@@ -267,36 +271,47 @@ function createMapService(options = {}) {
     return value;
   }
 
-  async function osmSearch(q, safeLimit, countryCode) {
-    const params = new URLSearchParams({ q, format: 'jsonv2', addressdetails: '1', namedetails: '1', limit: String(safeLimit) });
-    if (countryCode) params.set('countrycodes', String(countryCode).toLowerCase());
-    return normalizeSearchResults(await requestJson(`${geocodingBaseUrl}/search?${params}`), q).slice(0, safeLimit).map(x => ({...x, provider: 'OPENSTREETMAP', matchQuality: houseMatchQuality(q, '', x.address)}));
+  function assertVietMapConfigured() {
+    if (vietMapKey) return;
+    const error = new Error('VietMap chưa được cấu hình trên Backend. Kiểm tra VIETMAP_API_KEY.');
+    error.code = 'VIETMAP_NOT_CONFIGURED';
+    throw error;
   }
 
   async function search(query, { limit = 6, countryCode = 'vn', focusLat, focusLon, clientVersion = 2 } = {}) {
+    // v1 APKs assume every suggestion includes coordinates. VietMap V4
+    // suggestions do NOT contain coordinates; an old APK must be upgraded,
+    // rather than receiving silently substituted OpenStreetMap results.
+    if (Number(clientVersion) < 2) {
+      const error = new Error('Phiên bản iMove cũ không hỗ trợ VietMap V4. Vui lòng cập nhật ứng dụng.');
+      error.code = 'APP_UPDATE_REQUIRED';
+      throw error;
+    }
     const q = String(query || '').trim();
     if (q.length < 2) return [];
     if (q.length > 120) throw new RangeError('query is too long');
     const safeLimit = Math.min(10, Math.max(1, Number(limit) || 6));
     const focus = focusLat !== undefined && focusLon !== undefined && focusLat !== '' && focusLon !== ''
       ? assertLatLon(focusLat, focusLon) : null;
-    // Older released APKs assume every /search result already has coordinates.
-    // Keep the original OSM response for them until they are upgraded.
-    if (Number(clientVersion) < 2) return osmSearch(q, safeLimit, countryCode);
-    const cacheKey = `s:${searchProvider}:${q.toLowerCase()}:${safeLimit}:${countryCode}:${focus ? `${focus.latitude.toFixed(3)},${focus.longitude.toFixed(3)}` : ''}`;
+    assertVietMapConfigured();
+    const cacheKey = `s:VIETMAP_ONLY:${q.toLowerCase()}:${safeLimit}:${focus ? `${focus.latitude.toFixed(3)},${focus.longitude.toFixed(3)}` : ''}`;
     return cached(cacheKey, async () => {
-      if (searchProvider === 'VIETMAP') {
-        const params = new URLSearchParams({ apikey: vietMapKey, text: q, display_type: '5' });
-        if (focus) params.set('focus', `${focus.latitude},${focus.longitude}`);
-        try {
-          const results = normalizeVietMapSuggestions(await requestJson(`${vietMapBaseUrl}/api/autocomplete/v4?${params}`), q);
-          if (results.length || !fallbackToOsm) return results.slice(0, safeLimit);
-        } catch (error) {
-          if (!fallbackToOsm) throw new Error(`VietMap Autocomplete unavailable (${error.httpStatus || 'NETWORK'})`);
-          console.warn('[iMove Maps] VietMap Autocomplete unavailable:', error.httpStatus || 'NETWORK');
-        }
+      const params = new URLSearchParams({ apikey: vietMapKey, text: q, display_type: '5' });
+      if (focus) params.set('focus', `${focus.latitude},${focus.longitude}`);
+      try {
+        const payload = await requestJson(`${vietMapBaseUrl}/api/autocomplete/v4?${params}`);
+        return normalizeVietMapSuggestions(payload, q).slice(0, safeLimit);
+      } catch (cause) {
+        // Do not leak API key or full request URL in errors/logs.
+        const error = new Error(
+          cause.httpStatus === 401 ? 'VietMap từ chối API key (HTTP 401).' :
+          cause.httpStatus === 423 ? 'VietMap đã hết hạn mức hoặc chưa được cấp quyền API (HTTP 423).' :
+          'Không kết nối được VietMap. Hãy thử lại hoặc chọn ghim trên bản đồ.'
+        );
+        error.code = 'VIETMAP_UNAVAILABLE';
+        error.httpStatus = cause.httpStatus;
+        throw error;
       }
-      return osmSearch(q, safeLimit, countryCode);
     });
   }
 
@@ -304,8 +319,12 @@ function createMapService(options = {}) {
     const id = String(placeId || '').trim();
     if (!id.startsWith('vietmap:')) throw new RangeError('Unsupported Place ID');
     const refid = id.slice('vietmap:'.length);
-    if (refid.length > 2048 || !/^(auto|geocode):[A-Za-z0-9_:\-]+$/.test(refid)) throw new RangeError('Invalid VietMap Place ref_id');
-    if (!vietMapKey) throw new Error('VIETMAP_API_KEY is not configured');
+    if (refid.length > 2048 || !/^(auto|geocode):\S{1,2048}$/.test(refid)) throw new RangeError('Invalid VietMap Place ref_id');
+    if (!vietMapKey) {
+      const error = new Error('VietMap chưa được cấu hình trên Backend (VIETMAP_API_KEY).');
+      error.code = 'VIETMAP_NOT_CONFIGURED';
+      throw error;
+    }
     return cached(`place:${refid}`, async () => {
       const params = new URLSearchParams({ apikey: vietMapKey, refid });
       return normalizeVietMapPlace(await requestJson(`${vietMapBaseUrl}/api/place/v4?${params}`), id);
@@ -314,20 +333,23 @@ function createMapService(options = {}) {
 
   async function reverse(latitude, longitude) {
     const point = assertLatLon(latitude, longitude);
-    const cacheKey = `r:${searchProvider}:${point.latitude.toFixed(5)},${point.longitude.toFixed(5)}`;
+    assertVietMapConfigured();
+    const cacheKey = `r:VIETMAP_ONLY:${point.latitude.toFixed(5)},${point.longitude.toFixed(5)}`;
     return cached(cacheKey, async () => {
-      if (searchProvider === 'VIETMAP') {
-        const params = new URLSearchParams({ apikey: vietMapKey, lat: String(point.latitude), lng: String(point.longitude), display_type: '5' });
-        try {
-          const found = normalizeVietMapReverse(await requestJson(`${vietMapBaseUrl}/api/reverse/v4?${params}`), point.latitude, point.longitude);
-          if (found || !fallbackToOsm) return found;
-        } catch (error) {
-          if (!fallbackToOsm) throw new Error(`VietMap Reverse unavailable (${error.httpStatus || 'NETWORK'})`);
-          console.warn('[iMove Maps] VietMap Reverse unavailable:', error.httpStatus || 'NETWORK');
-        }
+      const params = new URLSearchParams({ apikey: vietMapKey, lat: String(point.latitude), lng: String(point.longitude), display_type: '5' });
+      try {
+        const payload = await requestJson(`${vietMapBaseUrl}/api/reverse/v4?${params}`);
+        return normalizeVietMapReverse(payload, point.latitude, point.longitude);
+      } catch (cause) {
+        const error = new Error(
+          cause.httpStatus === 401 ? 'VietMap từ chối API key (HTTP 401).' :
+          cause.httpStatus === 423 ? 'VietMap hết hạn mức hoặc thiếu quyền Reverse (HTTP 423).' :
+          'Không lấy được địa chỉ từ VietMap. Có thể nhập địa chỉ thủ công khi chọn ghim.'
+        );
+        error.code = 'VIETMAP_UNAVAILABLE';
+        error.httpStatus = cause.httpStatus;
+        throw error;
       }
-      const params = new URLSearchParams({ lat: String(point.latitude), lon: String(point.longitude), format: 'jsonv2', addressdetails: '1', namedetails: '1', zoom: '18' });
-      return normalizeReverseResult(await requestJson(`${geocodingBaseUrl}/reverse?${params}`), point.latitude, point.longitude);
     });
   }
 
@@ -347,9 +369,13 @@ function createMapService(options = {}) {
   function publicConfig() {
     return {
       // TrackAsia map rendering lives in Flutter TrackAsiaMapView, unchanged.
-      provider: 'OPENSTREETMAP', // retains backend tile/routing metadata from original V9
+      provider: 'TRACKASIA', // the visible Flutter map; legacy tileUrl below is NOT used for address search
       displayMapProvider: 'TRACKASIA', // Flutter TrackAsia SDK unchanged
       geocodingProvider: searchProvider,
+      searchIntegrationVersion: 'VIETMAP_V4_ONLY',
+      searchProviderLocked: true,
+      vietmapKeyConfigured: Boolean(vietMapKey), // key value is NEVER sent to clients
+      osmFallbackEnabled: false,
       tileUrl,
       attribution: '© OpenStreetMap contributors',
       geocodingViaBackend: true, routingViaBackend: true,
