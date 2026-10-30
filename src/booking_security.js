@@ -72,6 +72,10 @@ function createBookingSecurity({ getDb }) {
         return null;
       }
 
+      if (user.authRevokedAt && Number(payload.iat || 0) * 1000 <= new Date(user.authRevokedAt).getTime()) {
+        res.status(401).json({code:'SESSION_REVOKED',message:'Phiên đăng nhập đã bị thu hồi. Vui lòng đăng nhập lại.'});
+        return null;
+      }
       req.auth = { user, payload };
       return user;
     } catch (error) {

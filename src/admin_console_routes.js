@@ -143,7 +143,8 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
           ...driver,
           vehicle,
           registeredServiceCode: vehicle?.serviceCode || driver.serviceCode || '',
-          user: profile,
+          user: {...profile, status: user?.status || 'ACTIVE'},
+          accountStatus: user?.status || 'ACTIVE',
           fullName: profile.fullName || driver.fullName || null,
           phone: profile.phone || driver.phone || null,
           email: profile.email || driver.email || null,
@@ -937,6 +938,56 @@ function createAdminConsoleRouter({ getDb, getMatching = null, appVersion = '1.6
     } catch (error) {
       console.error('[CUSTOMER SOFT DELETE]', error);
       return res.status(error.status || 500).json({ code: error.status ? error.code : 'SOFT_DELETE_FAILED', message: error.status ? error.message : 'Không thể xóa mềm tài khoản. Xem log Backend.' });
+    }
+  });
+
+  // Driver account lock is distinct from KYC approval/rejection.
+  // Never alter trip/finance records and never let blocking be bypassed by a second login.
+  router.post('/api/admin/drivers/:driverId/account-lock', requireAdminAccess('drivers.suspend'), async (req, res) => {
+    try {
+      const id = objectIdOrNull(req.params.driverId);
+      if (!id) return res.status(400).json({code:'INVALID_DRIVER_ID',message:'Driver ID không hợp lệ.'});
+      const lock = req.body?.locked;
+      if (typeof lock !== 'boolean') return res.status(400).json({code:'INVALID_ACTION',message:'locked phải là true hoặc false.'});
+      const reason = String(req.body?.reason || '').trim();
+      if (lock && (reason.length < 10 || reason.length > 500)) return res.status(400).json({code:'LOCK_REASON_REQUIRED',message:'Vui lòng nhập lý do khóa từ 10 đến 500 ký tự.'});
+      const driver = await db().collection('drivers').findOne({_id:id});
+      if (!driver) return res.status(404).json({code:'DRIVER_NOT_FOUND',message:'Không tìm thấy tài xế.'});
+      const userIds = lookupIdVariants(driver.userId);
+      const user = await db().collection('users').findOne({_id:{$in:userIds},roles:'DRIVER'});
+      if (!user) return res.status(404).json({code:'DRIVER_USER_NOT_FOUND',message:'Không tìm thấy tài khoản đăng nhập của tài xế.'});
+      if (['DELETED','DISABLED'].includes(String(user.status||'').toUpperCase())) return res.status(409).json({code:'INVALID_ACCOUNT_STATUS',message:'Không thể thao tác với tài khoản đã xóa hoặc ngừng hoạt động.'});
+      if (lock && String(user.status || '').toUpperCase() === 'BLOCKED') return res.status(409).json({code:'ALREADY_LOCKED',message:'Tài khoản đã bị khóa. Hãy mở khóa trước khi khóa lại.'});
+      if (!lock && String(user.status || '').toUpperCase() !== 'BLOCKED') return res.status(409).json({code:'NOT_LOCKED',message:'Tài khoản hiện không bị khóa.'});
+      const driverIds = lookupIdVariants(driver._id);
+      if (lock) {
+        const activeBooking = await db().collection('bookings').findOne({driverId:{$in:driverIds},status:{$in:['DRIVER_ASSIGNED','DRIVER_ARRIVING','DRIVER_ARRIVED','IN_PROGRESS','STARTED','ON_TRIP']}},{projection:{_id:1,bookingCode:1}});
+        const activeOrder = await db().collection('orders').findOne({driverId:{$in:driverIds},status:{$in:['DRIVER_ASSIGNED','DRIVER_AT_MERCHANT','PICKED_UP','DELIVERING','DELIVERED']}},{projection:{_id:1}});
+        if (activeBooking || activeOrder || driver.activeBookingId || driver.activeCommerceOrderId) return res.status(409).json({code:'DRIVER_HAS_ACTIVE_WORK',message:'Tài xế đang có chuyến hoặc đơn giao chưa hoàn tất. Vui lòng xử lý trước khi khóa tài khoản.'});
+      }
+      const at = new Date();
+      const actorId = objectIdOrNull(req.adminAccess?.user?.id);
+      const userStatus = lock ? 'BLOCKED' : 'ACTIVE';
+      const lockState = lock ? {locked:true,reason,lockedAt:at,lockedBy:actorId} : {locked:false,reason:null,lockedAt:null,lockedBy:null,unlockedAt:at,unlockedBy:actorId};
+      // Status in users is the authoritative auth gate: access JWTs are checked against it on each request.
+      const updatedUser = await db().collection('users').updateOne({_id:user._id,status:user.status},{$set:{status:userStatus,lockReason:lock?reason:null,...(lock?{authRevokedAt:at}:{}),updatedAt:at}});
+      if (updatedUser.matchedCount !== 1) return res.status(409).json({code:'ACCOUNT_STATE_CHANGED',message:'Trạng thái tài khoản đã thay đổi. Vui lòng làm mới.'});
+      await db().collection('drivers').updateOne({_id:id},{$set:{accountLock:lockState,...(lock?{onlineStatus:'OFFLINE',updatedAt:at}:{updatedAt:at})}});
+      if (lock) {
+        await db().collection('auth_sessions').updateMany({userId:user._id,revokedAt:{$in:[null]}},{$set:{revokedAt:at,revokeReason:'ADMIN_DRIVER_LOCK',updatedAt:at}});
+        await db().collection('booking_offers_v69').updateMany({driverId:{$in:driverIds},status:'PENDING'},{$set:{status:'CANCELLED',cancelReason:'DRIVER_ACCOUNT_LOCKED',respondedAt:at,updatedAt:at}});
+        await db().collection('driver_offers').updateMany({driverId:{$in:driverIds},status:{$in:['PENDING','OFFERED']}},{$set:{status:'CANCELLED',reason:'DRIVER_ACCOUNT_LOCKED',updatedAt:at}});
+        await db().collection('driver_locations').deleteMany({driverId:{$in:driverIds}});
+        // Prevent sending new booking push notifications to a locked driver.
+        await db().collection('device_tokens').updateMany({userId:{$in:[user._id,...driverIds]}},{$set:{enabled:false,updatedAt:at}});
+      }
+      await auditAdmin(req,lock?'DRIVER_ACCOUNT_LOCK':'DRIVER_ACCOUNT_UNLOCK','DRIVER',id,
+        {status:user.status,onlineStatus:driver.onlineStatus,accountLock:driver.accountLock||null},
+        {status:userStatus,accountLock:lockState});
+      return res.json({ok:true,driverId:String(id),userId:String(user._id),status:userStatus,accountLock:lockState,message:lock?'Đã khóa tài khoản và buộc tài xế Offline.':'Đã mở khóa. Tài xế phải đăng nhập lại và tự bật Online.'});
+    } catch (error) {
+      console.error('[DRIVER_ACCOUNT_LOCK]',error);
+      return res.status(500).json({code:'DRIVER_LOCK_FAILED',message:'Không thể thay đổi trạng thái tài khoản tài xế. Kiểm tra log Backend.'});
     }
   });
 

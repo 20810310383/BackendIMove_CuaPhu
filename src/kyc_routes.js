@@ -90,8 +90,9 @@ function createAuthGuard(getDb) {
       if (!userId) return res.status(401).json({ message: 'Access Token không hợp lệ.' });
       const db = getDb();
       if (!db) return res.status(503).json({ message: 'Database chưa sẵn sàng.' });
-      const user = await db.collection('users').findOne({ _id: userId, status: { $ne: 'DISABLED' } });
+      const user = await db.collection('users').findOne({ _id: userId, status: 'ACTIVE' });
       if (!user) return res.status(401).json({ message: 'Tài khoản không tồn tại hoặc đã bị khóa.' });
+      if (user.authRevokedAt && Number(payload.iat || 0) * 1000 <= new Date(user.authRevokedAt).getTime()) return res.status(401).json({code:'SESSION_REVOKED',message:'Vui lòng đăng nhập lại.'});
       req.auth = {
         userId: user._id,
         user,
@@ -713,6 +714,8 @@ function createKycRouter({ getDb }) {
         approvalStatus: d.approvalStatus,
         kycStatus: d.kycStatus,
         onlineStatus: publicDriverOnlineStatus(d.onlineStatus),
+        accountStatus: userMap.get(String(d.userId))?.status || 'ACTIVE',
+        accountLock: d.accountLock || null,
         documentsStatus: d.documentsStatus || {},
         updatedAt: d.updatedAt || null,
       })));

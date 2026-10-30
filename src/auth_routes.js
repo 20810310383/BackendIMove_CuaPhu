@@ -384,6 +384,9 @@ function createAuthenticate(
           });
       }
 
+      if (user.authRevokedAt && Number(payload.iat || 0) * 1000 <= new Date(user.authRevokedAt).getTime()) {
+        return res.status(401).json({code:'SESSION_REVOKED',message:'Phiên đăng nhập đã bị thu hồi. Vui lòng đăng nhập lại.'});
+      }
       req.auth = {
         user,
         payload,
@@ -677,18 +680,6 @@ function createAuthRouter({
             });
         }
 
-        if (
-          user.status !==
-          'ACTIVE'
-        ) {
-          return res
-            .status(403)
-            .json({
-              message:
-                'Tài khoản đang bị khóa.',
-            });
-        }
-
         const passwordOk =
           await bcrypt.compare(
             password,
@@ -702,6 +693,16 @@ function createAuthRouter({
               message:
                 'Số điện thoại hoặc mật khẩu không đúng.',
             });
+        }
+
+        if (user.status !== 'ACTIVE') {
+          const driverLocked = Array.isArray(user.roles) && user.roles.includes('DRIVER') && user.status === 'BLOCKED';
+          return res.status(403).json({
+            code: driverLocked ? 'DRIVER_ACCOUNT_LOCKED' : 'ACCOUNT_INACTIVE',
+            message: driverLocked
+              ? `Tài khoản tài xế đã bị khóa. Lý do: ${user.lockReason || 'Vui lòng liên hệ Admin iMove.'}`
+              : 'Tài khoản chưa được phép đăng nhập.',
+          });
         }
 
         const roles =
